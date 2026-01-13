@@ -10,9 +10,58 @@ from psycopg.rows import dict_row
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
+def _get_auth() -> Any:
+    auth_type = os.environ.get("FASTMCP_AUTH_TYPE")
+    if not auth_type:
+        return None
+
+    # Full OIDC Proxy (handles login flow)
+    if auth_type.lower() == "oidc":
+        from fastmcp.server.auth.providers.oidc import OIDCProxy
+
+        config_url = os.environ.get("FASTMCP_OIDC_CONFIG_URL")
+        client_id = os.environ.get("FASTMCP_OIDC_CLIENT_ID")
+        client_secret = os.environ.get("FASTMCP_OIDC_CLIENT_SECRET")
+        base_url = os.environ.get("FASTMCP_OIDC_BASE_URL")
+
+        if not all([config_url, client_id, client_secret, base_url]):
+            raise RuntimeError(
+                "OIDC authentication requires FASTMCP_OIDC_CONFIG_URL, FASTMCP_OIDC_CLIENT_ID, "
+                "FASTMCP_OIDC_CLIENT_SECRET, and FASTMCP_OIDC_BASE_URL"
+            )
+
+        return OIDCProxy(
+            config_url=config_url,
+            client_id=client_id,
+            client_secret=client_secret,
+            base_url=base_url,
+            audience=os.environ.get("FASTMCP_OIDC_AUDIENCE"),
+        )
+
+    # Pure JWT Verification (resource server mode)
+    if auth_type.lower() == "jwt":
+        from fastmcp.server.auth.providers.jwt import JWTVerifier
+
+        jwks_uri = os.environ.get("FASTMCP_JWT_JWKS_URI")
+        issuer = os.environ.get("FASTMCP_JWT_ISSUER")
+
+        if not all([jwks_uri, issuer]):
+            raise RuntimeError(
+                "JWT verification requires FASTMCP_JWT_JWKS_URI and FASTMCP_JWT_ISSUER"
+            )
+
+        return JWTVerifier(
+            jwks_uri=jwks_uri,
+            issuer=issuer,
+            audience=os.environ.get("FASTMCP_JWT_AUDIENCE"),
+        )
+
+    return auth_type
+
+
 mcp = FastMCP(
     name=os.environ.get("MCP_SERVER_NAME", "PostgreSQL MCP Server"),
-    auth=os.environ.get("FASTMCP_AUTH_TYPE") if os.environ.get("FASTMCP_AUTH_TYPE") else None
+    auth=_get_auth()
 )
 
 

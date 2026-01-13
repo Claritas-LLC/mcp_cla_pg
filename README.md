@@ -135,15 +135,27 @@ Example:
 - `MCP_PORT` (default: `8000`)
 - `MCP_SERVER_NAME` (default: `PostgreSQL MCP Server`)
 
-### Auth0 Authentication
+### OAuth (OIDC) Authentication
 
-To secure the remote endpoint with Auth0 JWT validation, set the following environment variables:
+To secure the remote endpoint with generic OAuth (OIDC) authentication, set the following environment variables:
 
-- `FASTMCP_AUTH_TYPE=auth0`
-- `FASTMCP_AUTH0_DOMAIN`: Your Auth0 tenant domain (e.g., `your-tenant.us.auth0.com`)
-- `FASTMCP_AUTH0_AUDIENCE`: The API Identifier (Audience) from your Auth0 dashboard
+- `FASTMCP_AUTH_TYPE=oidc`
+- `FASTMCP_OIDC_CONFIG_URL`: URL of your OAuth provider's OIDC configuration (e.g., `https://your-tenant.us.auth0.com/.well-known/openid-configuration`)
+- `FASTMCP_OIDC_CLIENT_ID`: Client ID from your registered OAuth application
+- `FASTMCP_OIDC_CLIENT_SECRET`: Client secret from your registered OAuth application
+- `FASTMCP_OIDC_BASE_URL`: Public URL of your FastMCP server (e.g., `https://your-server.com`)
+- `FASTMCP_OIDC_AUDIENCE`: (Optional) Audience parameter if required by your provider
 
-When enabled, the server will validate the `Authorization: Bearer <token>` header against your Auth0 tenant's JWKS.
+When enabled, the server will manage OAuth client registration and token validation using the `OIDCProxy` provider.
+
+### JWT Token Verification (Alternative)
+
+If you only need to validate Bearer tokens without a full OAuth flow:
+
+- `FASTMCP_AUTH_TYPE=jwt`
+- `FASTMCP_JWT_JWKS_URI`: URL to the JWKS endpoint (e.g., `https://your-tenant.us.auth0.com/.well-known/jwks.json`)
+- `FASTMCP_JWT_ISSUER`: The expected issuer (`iss` claim)
+- `FASTMCP_JWT_AUDIENCE`: (Optional) The expected audience (`aud` claim)
 
 ## Deployment Procedures
 
@@ -210,7 +222,7 @@ url = "http://localhost:8000/mcp"
 enabled = true
 tool_timeout_sec = 60
 startup_timeout_sec = 10
-# If Auth0 is enabled, provide the token via an environment variable
+# If authentication is enabled, provide the token via an environment variable
 bearer_token_env_var = "POSTGRES_MCP_TOKEN"
 ```
 
@@ -292,4 +304,31 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 ### Local pip install fails with TLS CA bundle error (Windows)
 
 If you see an error like “could not find a suitable TLS CA certificate bundle”, use Docker-based deployment instead of local installs, or repair your Python/pip certificate configuration.
+
+## FAQ
+
+### Should I use OAuth (OIDC) or JWT verification?
+
+- Use OAuth (OIDC) if you want the server to participate in an interactive OAuth login/consent flow.
+- Use JWT verification if you already have a separate system issuing Bearer tokens and you only need this server to validate them.
+
+### Why does `db_locks` return an empty list?
+
+`db_locks` only returns sessions that are actively blocked on locks and the sessions that are blocking them. If nothing is currently waiting on a lock, it returns `[]`.
+
+### How do I run this over HTTPS?
+
+Terminate TLS in front of the server (Caddy/Nginx/Traefik/Cloudflare) and reverse proxy to `http://localhost:8000`. The MCP endpoint becomes `https://your-domain/mcp`.
+
+### How do I change the maximum rows returned by `run_query`?
+
+Set `MCP_MAX_ROWS` or pass `max_rows` when calling `run_query`.
+
+## Enhancements / Suggestions
+
+- Add per-tool authorization (scopes/roles) and tool allowlists by environment.
+- Add optional query redaction for `pg_stat_activity` output.
+- Add health checks for database connectivity and pool status.
+- Add additional DBA tools (bloat, vacuum progress, replication status, long transactions).
+- Add structured tests and a CI workflow (lint/typecheck, container build, smoke tests).
 
