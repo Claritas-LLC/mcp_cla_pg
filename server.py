@@ -1,14 +1,24 @@
 import json
+import logging
 import os
 import re
 from typing import Any
 
 from fastmcp import FastMCP
+from psycopg import Error as PsycopgError
+from psycopg import sql
 from psycopg.errors import UndefinedTable
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
+
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("mcp-postgres")
 
 def _get_auth() -> Any:
     auth_type = os.environ.get("FASTMCP_AUTH_TYPE")
@@ -101,11 +111,16 @@ ALLOW_WRITE = _env_bool("MCP_ALLOW_WRITE", False)
 DEFAULT_MAX_ROWS = _env_int("MCP_MAX_ROWS", 500)
 POOL_MIN_SIZE = _env_int("MCP_POOL_MIN_SIZE", 1)
 POOL_MAX_SIZE = _env_int("MCP_POOL_MAX_SIZE", 5)
+POOL_TIMEOUT = float(os.environ.get("MCP_POOL_TIMEOUT", "30.0"))
+POOL_MAX_WAITING = _env_int("MCP_POOL_MAX_WAITING", 10)
+STATEMENT_TIMEOUT_MS = _env_int("MCP_STATEMENT_TIMEOUT_MS", 30000) # 30s default
 
 pool = ConnectionPool(
     conninfo=DATABASE_URL,
     min_size=POOL_MIN_SIZE,
     max_size=POOL_MAX_SIZE,
+    timeout=POOL_TIMEOUT,
+    max_waiting=POOL_MAX_WAITING,
     kwargs={"row_factory": dict_row},
 )
 
@@ -150,6 +165,11 @@ _WRITE_KEYWORDS = {
     "set",
     "reset",
     "lock",
+    "commit",
+    "rollback",
+    "begin",
+    "savepoint",
+    "release",
 }
 
 _READONLY_START = {"select", "with", "show", "explain"}
@@ -159,9 +179,11 @@ def _is_sql_readonly(sql: str) -> bool:
     cleaned = _strip_sql_noise(sql).strip().lower()
     if not cleaned:
         return False
+    # Check if first word is a known read-only starting keyword
     first = cleaned.split(None, 1)[0]
     if first not in _READONLY_START:
         return False
+    # Ensure no write keywords exist anywhere in the tokens
     tokens = re.findall(r"[a-zA-Z_]+", cleaned)
     return not any(t in _WRITE_KEYWORDS for t in tokens)
 
@@ -170,6 +192,7 @@ def _require_readonly(sql: str) -> None:
     if ALLOW_WRITE:
         return
     if not _is_sql_readonly(sql):
+        logger.warning(f"BLOCKED write attempt in read-only mode: {sql[:200]}...")
         raise ValueError(
             "Write operations are disabled. Set MCP_ALLOW_WRITE=true to enable."
         )
@@ -187,9 +210,1029 @@ def _fetch_limited(cur, max_rows: int) -> list[dict[str, Any]]:
     return rows
 
 
+def _execute_safe(cur, sql: Any, params: Any = None) -> None:
+    """Executes a query with session-level timeouts and sanitized error handling."""
+    try:
+        # Set session-level timeout for this specific query execution
+        cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+        cur.execute(sql, params)
+    except PsycopgError as e:
+        logger.error(f"Database error: {str(e)}")
+        # Sanitize error message to prevent leaking schema details
+        # We only return the main error message if it's safe or a generic one
+        if "timeout" in str(e).lower():
+            raise RuntimeError("Query execution timed out.") from e
+        raise RuntimeError(f"Database operation failed: {e.diag.message_primary if hasattr(e, 'diag') and e.diag else 'Internal error'}") from e
+    except Exception as e:
+        logger.exception("Unexpected error during query execution")
+        raise RuntimeError("An unexpected error occurred while processing the query.") from e
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_request: Request) -> PlainTextResponse:
     return PlainTextResponse("ok")
+
+
+@mcp.tool
+def create_db_user(
+    username: str,
+    password: str,
+    privileges: str = "read",
+    database: str = "lenexa"
+) -> str:
+    """
+    Creates a new database user and assigns privileges.
+
+    Args:
+        username: The name of the user to create.
+        password: The password for the new user.
+        privileges: 'read' for SELECT only, 'read-write' for full DML access.
+        database: The database to grant access to (default: 'lenexa').
+    """
+    if not ALLOW_WRITE:
+        raise ValueError("Write operations are disabled. Set MCP_ALLOW_WRITE=true to enable user creation.")
+
+    if privileges not in ["read", "read-write"]:
+        raise ValueError("privileges must be either 'read' or 'read-write'")
+
+    # Basic input validation for username to prevent SQL injection in identifiers
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", username):
+        raise ValueError("Invalid username format. Use only alphanumeric characters and underscores, starting with a letter.")
+
+    # We use a separate connection if the target database is different from the current one
+    # to ensure GRANT commands on tables work correctly (they are database-local).
+    # However, for simplicity and protocol consistency, we use the existing pool
+    # and warn if the grants might be schema-specific to the current DB.
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            # 1. Create the user (Global operation)
+            logger.info(f"Creating database user: {username}")
+            _execute_safe(
+                cur,
+                sql.SQL("CREATE ROLE {} WITH LOGIN PASSWORD {}").format(
+                    sql.Identifier(username),
+                    sql.Literal(password),
+                ),
+            )
+
+            # 2. Grant connection to database
+            _execute_safe(
+                cur,
+                sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                    sql.Identifier(database),
+                    sql.Identifier(username),
+                ),
+            )
+
+            # 3. Grant schema/table permissions
+            # Note: These typically apply to the database the session is currently connected to.
+            if privileges == "read":
+                _execute_safe(
+                    cur,
+                    sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(username)),
+                )
+                _execute_safe(
+                    cur,
+                    sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(sql.Identifier(username)),
+                )
+                _execute_safe(
+                    cur,
+                    sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {}").format(
+                        sql.Identifier(username)
+                    ),
+                )
+            else:
+                _execute_safe(
+                    cur,
+                    sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {} TO {}").format(
+                        sql.Identifier(database),
+                        sql.Identifier(username),
+                    ),
+                )
+                _execute_safe(
+                    cur,
+                    sql.SQL("GRANT ALL PRIVILEGES ON SCHEMA public TO {}").format(sql.Identifier(username)),
+                )
+                _execute_safe(
+                    cur,
+                    sql.SQL("GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO {}").format(sql.Identifier(username)),
+                )
+                _execute_safe(
+                    cur,
+                    sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {}").format(
+                        sql.Identifier(username)
+                    ),
+                )
+
+            return f"User '{username}' created successfully with {privileges} privileges. Access granted to database '{database}'."
+
+
+@mcp.tool
+def drop_db_user(username: str) -> str:
+    """
+    Drops a database user (role).
+
+    Args:
+        username: The name of the user to drop.
+    """
+    if not ALLOW_WRITE:
+        raise ValueError("Write operations are disabled. Set MCP_ALLOW_WRITE=true to enable user deletion.")
+
+    # Basic input validation for username
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", username):
+        raise ValueError("Invalid username format.")
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            logger.info(f"Dropping database user: {username}")
+            _execute_safe(
+                cur,
+                sql.SQL("DROP OWNED BY {}").format(sql.Identifier(username)),
+            )
+            _execute_safe(
+                cur,
+                sql.SQL("DROP ROLE {}").format(sql.Identifier(username)),
+            )
+            return f"User '{username}' dropped successfully."
+
+
+@mcp.tool
+def check_bloat(limit: int = 50) -> list[dict[str, Any]]:
+    """
+    Identifies the top bloated tables and indexes and provides maintenance commands.
+
+    Args:
+        limit: Maximum number of objects to return (default: 50).
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            # Combined query for Table and Index bloat estimation
+            # Using a simplified version of the PostgreSQL Experts/Check_postgres bloat query
+            _execute_safe(
+                cur,
+                """
+                with bloat as (
+                  -- Table Bloat
+                  select
+                    'table' as type,
+                    schemaname,
+                    tblname as object_name,
+                    bs * tblpages as real_size,
+                    (tblpages - est_tblpages) * bs as extra_size,
+                    case when tblpages > 0 then (tblpages - est_tblpages)::float / tblpages else 0 end as bloat_ratio,
+                    case
+                      when (tblpages - est_tblpages) > 0
+                      then 'VACUUM FULL ' || quote_ident(schemaname) || '.' || quote_ident(tblname)
+                      else 'VACUUM ' || quote_ident(schemaname) || '.' || quote_ident(tblname)
+                    end as maintenance_cmd
+                  from (
+                    select
+                      ceil( reltuples / ( (bs-page_hdr)/fillfactor ) ) + ceil( toasttuples / 4 ) as est_tblpages,
+                      tblpages, fillfactor, bs, tblname, schemaname, page_hdr
+                    from (
+                      select
+                        (select current_setting('block_size')::int) as bs,
+                        24 as page_hdr,
+                        schemaname, tblname, reltuples, tblpages, toasttuples,
+                        coalesce(substring(
+                          array_to_string(reloptions, ' ') from 'fillfactor=([0-9]+)'
+                        )::int, 100) as fillfactor
+                      from (
+                        select
+                          n.nspname as schemaname,
+                          c.relname as tblname,
+                          c.reltuples,
+                          c.relpages as tblpages,
+                          c.reloptions,
+                          coalesce( (select sum(t.reltuples) from pg_class t where t.oid = c.reltoastrelid), 0) as toasttuples
+                        from pg_class c
+                        join pg_namespace n on n.oid = c.relnamespace
+                        where c.relkind = 'r'
+                          and n.nspname not in ('pg_catalog', 'information_schema')
+                      ) as foo
+                    ) as first_el_idx
+                  ) as second_el_idx
+
+                  union all
+
+                  -- Index Bloat (B-tree only)
+                  select
+                    'index' as type,
+                    schemaname,
+                    idxname as object_name,
+                    bs * relpages as real_size,
+                    (relpages - est_pages) * bs as extra_size,
+                    case when relpages > 0 then (relpages - est_pages)::float / relpages else 0 end as bloat_ratio,
+                    'REINDEX INDEX ' || quote_ident(schemaname) || '.' || quote_ident(idxname) as maintenance_cmd
+                  from (
+                    select
+                      bs, schemaname, idxname, relpages,
+                      ceil(reltuples * (avgwidth + 12.0) / (bs - 20.0) / 0.9) as est_pages
+                    from (
+                      select
+                        (select current_setting('block_size')::int) as bs,
+                        n.nspname as schemaname,
+                        c.relname as idxname,
+                        c.reltuples,
+                        c.relpages,
+                        (select avg(avg_width) from pg_stats where schemaname = n.nspname and tablename = t.relname) as avgwidth
+                      from pg_class c
+                      join pg_namespace n on n.oid = c.relnamespace
+                      join pg_index i on i.indexrelid = c.oid
+                      join pg_class t on t.oid = i.indrelid
+                      where c.relkind = 'i'
+                        and i.indisprimary = false
+                        and n.nspname not in ('pg_catalog', 'information_schema')
+                    ) as foo
+                  ) as third_el_idx
+                )
+                select
+                  type,
+                  schemaname as schema,
+                  object_name,
+                  real_size as size_bytes,
+                  extra_size as bloat_bytes,
+                  round(bloat_ratio::numeric * 100, 2) as bloat_percentage,
+                  maintenance_cmd
+                from bloat
+                where extra_size > 0
+                order by extra_size desc
+                limit %(limit)s
+                """,
+                {"limit": limit}
+            )
+            return cur.fetchall()
+
+
+@mcp.tool
+def db_stats(database: str | None = None, include_performance: bool = False) -> list[dict[str, Any]] | dict[str, Any]:
+    """
+    Get database-level statistics including commits, rollbacks, temp files, and deadlocks.
+    
+    Args:
+        database: Optional database name to filter results. If None, returns all databases.
+        include_performance: If True, includes additional performance metrics like cache hit ratio.
+    
+    Returns:
+        List of database statistics or single database stats if database specified.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            _execute_safe(cur, "select current_setting('server_version_num')::int as server_version_num")
+            version_row = cur.fetchone()
+            server_version_num = int(version_row["server_version_num"]) if version_row else 0
+            checksum_expr = "checksum_failures" if server_version_num >= 120000 else "null::bigint as checksum_failures"
+
+            if database:
+                _execute_safe(
+                    cur,
+                    f"""
+                    select
+                      datname as database,
+                      numbackends as active_connections,
+                      xact_commit as commits,
+                      xact_rollback as rollbacks,
+                      blks_read as blocks_read,
+                      blks_hit as blocks_hit,
+                      tup_returned as tuples_returned,
+                      tup_fetched as tuples_fetched,
+                      tup_inserted as tuples_inserted,
+                      tup_updated as tuples_updated,
+                      tup_deleted as tuples_deleted,
+                      conflicts,
+                      temp_files,
+                      temp_bytes,
+                      deadlocks,
+                      {checksum_expr},
+                      blk_read_time as block_read_time_ms,
+                      blk_write_time as block_write_time_ms,
+                      stats_reset
+                    from pg_stat_database
+                    where datname = %(database)s
+                    """,
+                    {"database": database}
+                )
+                result = cur.fetchone()
+                if not result:
+                    return {"error": f"Database '{database}' not found"}
+                
+                if include_performance:
+                    # Add cache hit ratio calculation
+                    total_blocks = result["blocks_read"] + result["blocks_hit"]
+                    result["cache_hit_ratio"] = round((result["blocks_hit"] / total_blocks * 100), 2) if total_blocks > 0 else 0
+                    
+                    # Add transaction success rate
+                    total_xacts = result["commits"] + result["rollbacks"]
+                    result["transaction_success_rate"] = round((result["commits"] / total_xacts * 100), 2) if total_xacts > 0 else 0
+                
+                return result
+            else:
+                _execute_safe(
+                    cur,
+                    f"""
+                    select
+                      datname as database,
+                      numbackends as active_connections,
+                      xact_commit as commits,
+                      xact_rollback as rollbacks,
+                      blks_read as blocks_read,
+                      blks_hit as blocks_hit,
+                      tup_returned as tuples_returned,
+                      tup_fetched as tuples_fetched,
+                      tup_inserted as tuples_inserted,
+                      tup_updated as tuples_updated,
+                      tup_deleted as tuples_deleted,
+                      conflicts,
+                      temp_files,
+                      temp_bytes,
+                      deadlocks,
+                      {checksum_expr},
+                      blk_read_time as block_read_time_ms,
+                      blk_write_time as block_write_time_ms,
+                      stats_reset
+                    from pg_stat_database
+                    where datname not like 'template%%'
+                    order by datname
+                    """
+                )
+                results = cur.fetchall()
+                
+                if include_performance:
+                    # Enhance each result with performance metrics
+                    for result in results:
+                        total_blocks = result["blocks_read"] + result["blocks_hit"]
+                        result["cache_hit_ratio"] = round((result["blocks_hit"] / total_blocks * 100), 2) if total_blocks > 0 else 0
+                        
+                        total_xacts = result["commits"] + result["rollbacks"]
+                        result["transaction_success_rate"] = round((result["commits"] / total_xacts * 100), 2) if total_xacts > 0 else 0
+                
+                return results
+
+
+@mcp.tool
+def analyze_table_health(
+    schema: str | None = None,
+    min_size_mb: int = 50,
+    include_bloat: bool = True,
+    include_maintenance: bool = True,
+    include_autovacuum: bool = True,
+    limit: int = 30
+) -> dict[str, Any]:
+    """
+    Comprehensive table health analysis combining bloat detection, maintenance needs, and autovacuum recommendations.
+    
+    Args:
+        schema: Optional schema name to filter analysis.
+        min_size_mb: Minimum table size in MB to consider.
+        include_bloat: Include bloat analysis (default: True).
+        include_maintenance: Include maintenance statistics (default: True).
+        include_autovacuum: Include autovacuum recommendations (default: True).
+        limit: Maximum number of tables to analyze (default: 30).
+    
+    Returns:
+        Dictionary containing table health summary, detailed analysis, and recommendations.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            results = {
+                "summary": {
+                    "total_tables_analyzed": 0,
+                    "tables_with_issues": 0,
+                    "critical_issues": 0,
+                    "recommendations": []
+                },
+                "tables": [],
+                "overall_health_score": 100
+            }
+
+            # Get candidate tables
+            _execute_safe(
+                cur,
+                """
+                select
+                  n.nspname as schema,
+                  c.relname as table,
+                  pg_total_relation_size(c.oid) as size_bytes,
+                  c.reltuples::bigint as approx_rows,
+                  s.n_live_tup as live_tuples,
+                  s.n_dead_tup as dead_tuples,
+                  s.n_tup_ins as inserts,
+                  s.n_tup_upd as updates,
+                  s.n_tup_del as deletes,
+                  s.seq_scan,
+                  s.idx_scan,
+                  s.last_vacuum,
+                  s.last_autovacuum,
+                  s.last_analyze,
+                  s.last_autoanalyze,
+                  case
+                    when coalesce(s.last_autovacuum, s.last_vacuum) is null then null
+                    else extract(epoch from (now() - coalesce(s.last_autovacuum, s.last_vacuum)))
+                  end as seconds_since_vacuum,
+                  case
+                    when coalesce(s.last_autoanalyze, s.last_analyze) is null then null
+                    else extract(epoch from (now() - coalesce(s.last_autoanalyze, s.last_analyze)))
+                  end as seconds_since_analyze,
+                  age(c.relfrozenxid) as frozenxid_age
+                from pg_class c
+                join pg_namespace n on n.oid = c.relnamespace
+                left join pg_stat_user_tables s on s.relid = c.oid
+                where c.relkind = 'r'
+                  and n.nspname not in ('pg_catalog', 'information_schema')
+                  and (%(schema)s::text is null or n.nspname = %(schema)s::text)
+                  and pg_total_relation_size(c.oid) > %(min_size)s * 1024 * 1024
+                order by pg_total_relation_size(c.oid) desc
+                limit %(limit)s
+                """,
+                {"schema": schema, "min_size": min_size_mb, "limit": limit}
+            )
+            candidate_tables = cur.fetchall()
+            
+            results["summary"]["total_tables_analyzed"] = len(candidate_tables)
+
+            for table in candidate_tables:
+                table_analysis = {
+                    "schema": table["schema"],
+                    "table": table["table"],
+                    "size_mb": round(table["size_bytes"] / (1024 * 1024), 1),
+                    "approx_rows": table["approx_rows"],
+                    "health_score": 100,
+                    "issues": [],
+                    "recommendations": []
+                }
+
+                # Calculate modification rate
+                total_mods = (table["inserts"] or 0) + (table["updates"] or 0) + (table["deletes"] or 0)
+                age_seconds_candidates = [table.get("seconds_since_vacuum"), table.get("seconds_since_analyze")]
+                age_seconds = min([s for s in age_seconds_candidates if s is not None], default=86400)
+                age_days = max(float(age_seconds) / 86400.0, 1.0)
+                mod_rate_per_day = total_mods / age_days
+
+                # 1. Bloat Analysis
+                if include_bloat:
+                    _execute_safe(
+                        cur,
+                        """
+                        with bloat_estimate as (
+                          select
+                            case
+                              when (s.n_live_tup + s.n_dead_tup) > 0
+                              then round((s.n_dead_tup::float / (s.n_live_tup + s.n_dead_tup) * 100)::numeric, 2)
+                              else 0
+                            end as dead_tuple_percent,
+                            case
+                              when pg_total_relation_size(c.oid) > 0
+                              then round((s.n_dead_tup * 100.0 / greatest(s.n_live_tup, 1))::numeric, 2)
+                              else 0
+                            end as estimated_bloat_percent
+                          from pg_class c
+                          join pg_namespace n on n.oid = c.relnamespace
+                          left join pg_stat_user_tables s on s.relid = c.oid
+                          where n.nspname = %(schema)s and c.relname = %(table)s
+                        )
+                        select dead_tuple_percent, estimated_bloat_percent
+                        from bloat_estimate
+                        """,
+                        {"schema": table["schema"], "table": table["table"]}
+                    )
+                    bloat_info = cur.fetchone()
+                    
+                    if bloat_info:
+                        dead_tuple_percent = bloat_info["dead_tuple_percent"]
+                        estimated_bloat_percent = bloat_info["estimated_bloat_percent"]
+                        
+                        if dead_tuple_percent > 20:
+                            table_analysis["issues"].append(f"High dead tuple ratio: {dead_tuple_percent}%")
+                            table_analysis["recommendations"].append("Run VACUUM to clean up dead tuples")
+                            table_analysis["health_score"] -= 20
+                        elif dead_tuple_percent > 10:
+                            table_analysis["issues"].append(f"Moderate dead tuple ratio: {dead_tuple_percent}%")
+                            table_analysis["health_score"] -= 10
+
+                # 2. Maintenance Analysis
+                if include_maintenance:
+                    # Check freeze risk
+                    _execute_safe(
+                        cur,
+                        """
+                        select current_setting('autovacuum_freeze_max_age')::bigint as freeze_max_age
+                        """
+                    )
+                    freeze_settings = cur.fetchone()
+                    freeze_max_age = freeze_settings["freeze_max_age"]
+                    
+                    age_percent = (table["frozenxid_age"] / freeze_max_age * 100) if freeze_max_age > 0 else 0
+                    
+                    if age_percent > 50:
+                        table_analysis["issues"].append(f"High transaction ID age: {round(age_percent, 1)}% of freeze_max_age")
+                        table_analysis["recommendations"].append("Prioritize freeze operations - table at risk of wraparound")
+                        table_analysis["health_score"] -= 30
+                        results["summary"]["critical_issues"] += 1
+                    elif age_percent > 25:
+                        table_analysis["issues"].append(f"Moderate transaction ID age: {round(age_percent, 1)}% of freeze_max_age")
+                        table_analysis["health_score"] -= 15
+
+                    # Check vacuum/analyze recency
+                    days_since_vacuum = float(table["seconds_since_vacuum"]) / 86400.0 if table.get("seconds_since_vacuum") is not None else 999.0
+                    days_since_analyze = float(table["seconds_since_analyze"]) / 86400.0 if table.get("seconds_since_analyze") is not None else 999.0
+                    
+                    if days_since_vacuum > 7:
+                        table_analysis["issues"].append(f"No vacuum in {int(days_since_vacuum)} days")
+                        table_analysis["health_score"] -= 10
+                    
+                    if days_since_analyze > 7:
+                        table_analysis["issues"].append(f"No analyze in {int(days_since_analyze)} days")
+                        table_analysis["health_score"] -= 5
+
+                # 3. Autovacuum Recommendations
+                if include_autovacuum:
+                    if mod_rate_per_day > 1000:
+                        table_analysis["recommendations"].append("High modification rate - consider aggressive autovacuum settings")
+                        table_analysis["autovacuum_suggestions"] = {
+                            "autovacuum_vacuum_scale_factor": 0.1,
+                            "autovacuum_vacuum_threshold": 50,
+                            "autovacuum_vacuum_cost_delay": 0
+                        }
+                    elif mod_rate_per_day < 100:
+                        table_analysis["recommendations"].append("Low modification rate - standard autovacuum settings sufficient")
+                        table_analysis["autovacuum_suggestions"] = {
+                            "autovacuum_vacuum_scale_factor": 0.2,
+                            "autovacuum_vacuum_threshold": 100
+                        }
+
+                # Final health score adjustments
+                if table_analysis["health_score"] < 70:
+                    results["summary"]["tables_with_issues"] += 1
+                
+                table_analysis["health_score"] = max(0, min(100, table_analysis["health_score"]))
+                results["tables"].append(table_analysis)
+
+            # Calculate overall health score
+            if results["tables"]:
+                avg_health = sum(t["health_score"] for t in results["tables"]) / len(results["tables"])
+                critical_ratio = results["summary"]["critical_issues"] / len(results["tables"])
+                
+                results["overall_health_score"] = max(0, avg_health - (critical_ratio * 20))
+
+            # Generate summary recommendations
+            if results["summary"]["critical_issues"] > 0:
+                results["summary"]["recommendations"].append(f"URGENT: {results['summary']['critical_issues']} tables have critical issues requiring immediate attention")
+            
+            if results["summary"]["tables_with_issues"] > len(results["tables"]) * 0.5:
+                results["summary"]["recommendations"].append("More than 50% of analyzed tables have health issues - consider database-wide maintenance")
+            
+            if results["overall_health_score"] < 70:
+                results["summary"]["recommendations"].append("Overall database health is concerning - prioritize maintenance operations")
+
+            return results
+
+
+@mcp.tool
+def database_security_performance_metrics(cache_hit_threshold: int = 90, connection_usage_threshold: float = 0.8) -> dict[str, Any]:
+    """
+    Analyzes database security and performance metrics, identifying issues and providing optimization commands.
+    
+    Args:
+        cache_hit_threshold: Minimum acceptable cache hit ratio percentage (default: 90).
+        connection_usage_threshold: Maximum acceptable connection usage ratio (default: 0.8).
+    
+    Returns:
+        Dictionary containing security metrics, performance metrics, issues found, and recommended fixes.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            results = {
+                "security_metrics": {},
+                "performance_metrics": {},
+                "issues_found": [],
+                "recommended_fixes": []
+            }
+
+            # 1. SSL/TLS Configuration
+            _execute_safe(
+                cur,
+                """
+                select
+                  name,
+                  setting,
+                  context,
+                  pending_restart
+                from pg_settings
+                where name in ('ssl', 'ssl_ciphers', 'ssl_cert_file', 'ssl_key_file', 'ssl_ca_file')
+                order by name
+                """
+            )
+            ssl_settings = cur.fetchall()
+            results["security_metrics"]["ssl_settings"] = ssl_settings
+
+            # Check if SSL is enabled
+            ssl_enabled = any(s["name"] == "ssl" and s["setting"] == "on" for s in ssl_settings)
+            if not ssl_enabled:
+                results["issues_found"].append("SSL is not enabled - connections are not encrypted")
+                results["recommended_fixes"].append("Enable SSL by setting ssl = on in postgresql.conf and configure certificates")
+
+            # 2. Authentication and Connection Security
+            try:
+                _execute_safe(
+                    cur,
+                    """
+                    select
+                      r.rolname as user,
+                      r.oid as usesysid,
+                      r.rolcreatedb as usecreatedb,
+                      r.rolsuper as usesuper,
+                      r.rolreplication as userepl,
+                      r.rolbypassrls as usebypassrls,
+                      s.passwd is not null as has_password,
+                      s.valuntil as password_expiry,
+                      s.valuntil - now() as time_until_expiry
+                    from pg_roles r
+                    left join pg_shadow s on s.usename = r.rolname
+                    where r.rolname not like 'pg_%'
+                    order by r.rolname
+                    """
+                )
+                user_security = cur.fetchall()
+            except RuntimeError:
+                _execute_safe(
+                    cur,
+                    """
+                    select
+                      r.rolname as user,
+                      r.oid as usesysid,
+                      r.rolcreatedb as usecreatedb,
+                      r.rolsuper as usesuper,
+                      r.rolreplication as userepl,
+                      r.rolbypassrls as usebypassrls,
+                      null::boolean as has_password,
+                      null::timestamptz as password_expiry,
+                      null::interval as time_until_expiry
+                    from pg_roles r
+                    where r.rolname not like 'pg_%'
+                    order by r.rolname
+                    """
+                )
+                user_security = cur.fetchall()
+            results["security_metrics"]["user_accounts"] = user_security
+
+            # Check for superusers and password issues
+            superusers = [u for u in user_security if u["usesuper"]]
+            if len(superusers) > 1:
+                results["issues_found"].append(f"Multiple superusers found: {[u['user'] for u in superusers]}")
+                results["recommended_fixes"].append("Review superuser privileges and limit to minimum required")
+
+            users_without_passwords = [u for u in user_security if not u["has_password"]]
+            if users_without_passwords:
+                results["issues_found"].append(f"Users without passwords: {[u['user'] for u in users_without_passwords]}")
+                results["recommended_fixes"].append("Set strong passwords for all user accounts")
+
+            # 3. Cache Hit Ratio Analysis
+            _execute_safe(
+                cur,
+                """
+                select
+                  datname as database,
+                  blks_hit,
+                  blks_read,
+                  case
+                    when (blks_hit + blks_read) > 0
+                    then round((blks_hit::float / (blks_hit + blks_read) * 100)::numeric, 2)
+                    else 0
+                  end as cache_hit_ratio
+                from pg_stat_database
+                where datname not like 'template%%'
+                order by cache_hit_ratio asc
+                """
+            )
+            cache_metrics = cur.fetchall()
+            results["performance_metrics"]["cache_hit_ratios"] = cache_metrics
+
+            # Identify databases with poor cache hit ratios
+            poor_cache_databases = [db for db in cache_metrics if db["cache_hit_ratio"] < cache_hit_threshold]
+            if poor_cache_databases:
+                results["issues_found"].append(f"Low cache hit ratios: {[f'{db['database']} ({db['cache_hit_ratio']}%)' for db in poor_cache_databases]}")
+                results["recommended_fixes"].append(f"Consider increasing shared_buffers for better cache performance (threshold: {cache_hit_threshold}%)")
+
+            # 4. Connection Pool and Limits
+            _execute_safe(
+                cur,
+                """
+                select
+                  current_setting('max_connections')::int as max_connections,
+                  current_setting('superuser_reserved_connections')::int as reserved_connections,
+                  count(*) as active_connections,
+                  current_setting('max_connections')::int - count(*) as available_connections
+                from pg_stat_activity
+                where state != 'idle'
+                """
+            )
+            connection_metrics = cur.fetchone()
+            results["performance_metrics"]["connection_usage"] = connection_metrics
+
+            if connection_metrics["active_connections"] > connection_metrics["max_connections"] * connection_usage_threshold:
+                results["issues_found"].append(f"High connection usage: {connection_metrics['active_connections']}/{connection_metrics['max_connections']} connections active")
+                results["recommended_fixes"].append(f"Consider increasing max_connections or implementing connection pooling (threshold: {int(connection_usage_threshold*100)}%)")
+
+            # 5. WAL and Checkpoint Performance
+            _execute_safe(
+                cur,
+                """
+                select
+                  checkpoints_timed,
+                  checkpoints_req,
+                  checkpoint_write_time,
+                  checkpoint_sync_time,
+                  buffers_checkpoint,
+                  buffers_clean,
+                  buffers_backend,
+                  case
+                    when checkpoints_timed + checkpoints_req > 0
+                    then round((checkpoints_req::float / (checkpoints_timed + checkpoints_req) * 100)::numeric, 2)
+                    else 0
+                  end as checkpoint_request_ratio
+                from pg_stat_bgwriter
+                """
+            )
+            checkpoint_metrics = cur.fetchone()
+            results["performance_metrics"]["checkpoint_stats"] = checkpoint_metrics
+
+            if checkpoint_metrics["checkpoint_request_ratio"] > 30:
+                results["issues_found"].append(f"High checkpoint request ratio: {checkpoint_metrics['checkpoint_request_ratio']}%")
+                results["recommended_fixes"].append("Consider increasing checkpoint_segments or checkpoint_timeout to reduce checkpoint frequency")
+
+            # 6. Lock and Deadlock Analysis
+            _execute_safe(
+                cur,
+                """
+                select
+                  deadlocks,
+                  conflicts,
+                  temp_files,
+                  temp_bytes
+                from pg_stat_database
+                where datname = current_database()
+                """
+            )
+            lock_metrics = cur.fetchone()
+            results["performance_metrics"]["lock_stats"] = lock_metrics
+
+            if lock_metrics["deadlocks"] > 0:
+                results["issues_found"].append(f"Deadlocks detected: {lock_metrics['deadlocks']}")
+                results["recommended_fixes"].append("Review application locking patterns and transaction isolation levels")
+
+            if lock_metrics["temp_files"] > 100:
+                results["issues_found"].append(f"High temp file usage: {lock_metrics['temp_files']} files, {lock_metrics['temp_bytes']} bytes")
+                results["recommended_fixes"].append("Consider increasing work_mem to reduce temporary file creation")
+
+            # 7. Extension Security
+            _execute_safe(
+                cur,
+                """
+                select
+                  extname as extension,
+                  extversion as version,
+                  n.nspname as schema
+                from pg_extension e
+                join pg_namespace n on n.oid = e.extnamespace
+                where extname not in ('plpgsql')
+                order by extname
+                """
+            )
+            extensions = cur.fetchall()
+            results["security_metrics"]["installed_extensions"] = extensions
+
+            # Check for potentially risky extensions
+            risky_extensions = ["dblink", "postgres_fdw", "file_fdw", "plpython3u", "plperlu"]
+            installed_risky = [ext for ext in extensions if ext["extension"] in risky_extensions]
+            if installed_risky:
+                results["issues_found"].append(f"Potentially risky extensions installed: {[ext['extension'] for ext in installed_risky]}")
+                results["recommended_fixes"].append("Review and restrict access to extensions that enable external connections or code execution")
+
+            # 8. Generate specific configuration commands
+            if not ssl_enabled:
+                results["recommended_fixes"].append("# Generate SSL certificates and update postgresql.conf:")
+                results["recommended_fixes"].append("# ssl = on")
+                results["recommended_fixes"].append("# ssl_cert_file = 'server.crt'")
+                results["recommended_fixes"].append("# ssl_key_file = 'server.key'")
+                results["recommended_fixes"].append("# ssl_ca_file = 'root.crt'")
+
+            if poor_cache_databases:
+                results["recommended_fixes"].append(f"# Increase shared_buffers (currently {next((s['setting'] for s in ssl_settings if s['name'] == 'shared_buffers'), 'unknown')}):")
+                results["recommended_fixes"].append("# shared_buffers = 256MB  # Adjust based on available RAM")
+
+            if connection_metrics["active_connections"] > connection_metrics["max_connections"] * 0.8:
+                results["recommended_fixes"].append(f"# Increase max_connections (currently {connection_metrics['max_connections']}):")
+                results["recommended_fixes"].append("# max_connections = 200  # Adjust based on workload")
+
+            if checkpoint_metrics["checkpoint_request_ratio"] > 30:
+                results["recommended_fixes"].append("# Optimize checkpoint settings:")
+                results["recommended_fixes"].append("# checkpoint_timeout = 15min")
+                results["recommended_fixes"].append("# max_wal_size = 4GB")
+                results["recommended_fixes"].append("# min_wal_size = 1GB")
+
+            if lock_metrics["temp_files"] > 100:
+                results["recommended_fixes"].append("# Increase work_mem (use caution, affects per-operation memory):")
+                results["recommended_fixes"].append("# work_mem = 64MB  # Adjust based on concurrent connections")
+
+            return results
+
+
+@mcp.tool
+def analyze_sessions(
+    include_idle: bool = True,
+    include_active: bool = True,
+    include_locked: bool = True,
+    min_duration_seconds: int = 60,
+    min_idle_seconds: int = 60
+) -> dict[str, Any]:
+    """
+    Comprehensive session analysis combining active queries, idle sessions, and locks.
+    
+    Args:
+        include_idle: Include idle and idle-in-transaction sessions.
+        include_active: Include active query sessions.
+        include_locked: Include sessions involved in locks.
+        min_duration_seconds: Minimum query/transaction duration to include.
+        min_idle_seconds: Minimum idle time for idle sessions.
+    
+    Returns:
+        Dictionary containing session summary, detailed sessions, and recommendations.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            results = {
+                "summary": {},
+                "active_sessions": [],
+                "idle_sessions": [],
+                "locked_sessions": [],
+                "recommendations": []
+            }
+
+            # Get overall session statistics
+            _execute_safe(
+                cur,
+                """
+                select
+                  count(*) as total_sessions,
+                  count(*) filter (where state = 'active') as active_count,
+                  count(*) filter (where state like 'idle%') as idle_count,
+                  count(*) filter (where wait_event is not null) as waiting_count
+                from pg_stat_activity
+                where pid <> pg_backend_pid()
+                """
+            )
+            results["summary"] = cur.fetchone()
+
+            # Active sessions with long-running queries/transactions
+            if include_active:
+                _execute_safe(
+                    cur,
+                    """
+                    select
+                      pid,
+                      usename as user,
+                      datname as database,
+                      application_name,
+                      client_addr::text as client_addr,
+                      state,
+                      now() - xact_start as xact_age,
+                      now() - query_start as query_age,
+                      wait_event_type,
+                      wait_event,
+                      left(query, 5000) as query
+                    from pg_stat_activity
+                    where pid <> pg_backend_pid()
+                      and (
+                        (query_start is not null and now() - query_start > make_interval(secs => %(min_duration)s))
+                        or (xact_start is not null and now() - xact_start > make_interval(secs => %(min_duration)s))
+                      )
+                    order by greatest(coalesce(now() - query_start, interval '0'), coalesce(now() - xact_start, interval '0')) desc
+                    """,
+                    {"min_duration": min_duration_seconds}
+                )
+                results["active_sessions"] = cur.fetchall()
+
+            # Idle sessions
+            if include_idle:
+                _execute_safe(
+                    cur,
+                    """
+                    select
+                      pid,
+                      usename as user,
+                      datname as database,
+                      application_name,
+                      state,
+                      now() - backend_start as connection_duration,
+                      now() - state_change as idle_duration,
+                      left(query, 1000) as last_query
+                    from pg_stat_activity
+                    where state in ('idle', 'idle in transaction', 'idle in transaction (aborted)')
+                      and pid <> pg_backend_pid()
+                      and now() - state_change > make_interval(secs => %(min_idle)s)
+                    order by state_change asc
+                    """,
+                    {"min_idle": min_idle_seconds}
+                )
+                results["idle_sessions"] = cur.fetchall()
+
+            # Locked sessions (blocked and blocking)
+            if include_locked:
+                _execute_safe(
+                    cur,
+                    """
+                    with lock_chains as (
+                      select
+                        bl.pid as blocked_pid,
+                        a.usename as blocked_user,
+                        a.datname as blocked_database,
+                        a.application_name as blocked_application_name,
+                        a.client_addr::text as blocked_client_addr,
+                        a.state as blocked_state,
+                        now() - a.query_start as blocked_execution_time,
+                        left(a.query, 500) as blocked_query,
+                        bl.locktype,
+                        bl.mode as blocked_lock_mode,
+                        -- Find the blocking session
+                        (select pid from pg_locks where granted and pg_locks.locktype = bl.locktype 
+                         and pg_locks.database = bl.database and pg_locks.relation = bl.relation 
+                         and pg_locks.page = bl.page and pg_locks.tuple = bl.tuple 
+                         and pg_locks.virtualxid = bl.virtualxid and pg_locks.transactionid = bl.transactionid 
+                         and pg_locks.classid = bl.classid and pg_locks.objid = bl.objid 
+                         and pg_locks.objsubid = bl.objsubid limit 1) as blocking_pid
+                      from pg_catalog.pg_locks bl
+                      join pg_catalog.pg_stat_activity a on a.pid = bl.pid
+                      where not bl.granted
+                        and bl.pid <> pg_backend_pid()
+                    )
+                    select
+                      blocked_pid,
+                      blocked_user,
+                      blocked_database,
+                      blocked_application_name,
+                      blocked_client_addr,
+                      blocked_state,
+                      blocked_execution_time,
+                      blocked_query,
+                      blocked_lock_mode,
+                      blocking_pid,
+                      (select usename from pg_stat_activity where pid = blocking_pid) as blocking_user,
+                      (select left(query, 200) from pg_stat_activity where pid = blocking_pid) as blocking_query
+                    from lock_chains
+                    where blocking_pid is not null
+                    order by blocked_execution_time desc
+                    """
+                )
+                results["locked_sessions"] = cur.fetchall()
+
+            # Generate recommendations based on findings
+            if results["active_sessions"]:
+                longest_active = max(results["active_sessions"], key=lambda x: x["query_age"] or x["xact_age"])
+                results["recommendations"].append(
+                    f"Longest active session: PID {longest_active['pid']} ({longest_active['user']}) running for {longest_active['query_age']}"
+                )
+
+            if results["idle_sessions"]:
+                longest_idle = max(results["idle_sessions"], key=lambda x: x["idle_duration"])
+                results["recommendations"].append(
+                    f"Longest idle session: PID {longest_idle['pid']} ({longest_idle['user']}) idle for {longest_idle['idle_duration']}"
+                )
+
+            if results["locked_sessions"]:
+                results["recommendations"].append(
+                    f"Found {len(results['locked_sessions'])} sessions waiting on locks. Consider reviewing blocking sessions."
+                )
+
+            return results
+
+
+@mcp.tool
+def kill_session(pid: int) -> dict[str, Any]:
+    """
+    Terminates a database session by its process ID (PID).
+    Requires MCP_ALLOW_WRITE=true.
+
+    Args:
+        pid: The process ID of the session to terminate.
+    """
+    if not ALLOW_WRITE:
+        raise ValueError("Write operations are disabled. Set MCP_ALLOW_WRITE=true to enable killing sessions.")
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            logger.info(f"Terminating session with PID: {pid}")
+            _execute_safe(
+                cur,
+                "select pg_terminate_backend(%(pid)s) as terminated",
+                {"pid": pid}
+            )
+            row = cur.fetchone()
+            terminated = row["terminated"] if row else False
+            return {
+                "pid": pid,
+                "terminated": terminated,
+                "message": f"Session {pid} terminated." if terminated else f"Failed to terminate session {pid} or session not found."
+            }
 
 
 @mcp.tool
@@ -201,7 +1244,8 @@ def ping() -> dict[str, Any]:
 def server_info() -> dict[str, Any]:
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
+            _execute_safe(
+                cur,
                 """
                 select
                   current_database() as database,
@@ -221,7 +1265,67 @@ def server_info() -> dict[str, Any]:
                 "version": row["version"],
                 "allow_write": ALLOW_WRITE,
                 "default_max_rows": DEFAULT_MAX_ROWS,
+                "statement_timeout_ms": STATEMENT_TIMEOUT_MS,
             }
+
+
+@mcp.tool
+def get_db_parameters(pattern: str | None = None) -> list[dict[str, Any]]:
+    """
+    Retrieves database configuration parameters (GUCs).
+
+    Args:
+        pattern: Optional regex pattern to filter parameter names (e.g., 'max_connections' or 'shared_.*').
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            if pattern:
+                _execute_safe(
+                    cur,
+                    """
+                    select
+                      name,
+                      setting,
+                      unit,
+                      category,
+                      short_desc,
+                      context,
+                      vartype,
+                      min_val,
+                      max_val,
+                      enumvals,
+                      boot_val,
+                      reset_val,
+                      pending_restart
+                    from pg_settings
+                    where name ~* %(pattern)s
+                    order by name
+                    """,
+                    {"pattern": pattern},
+                )
+            else:
+                _execute_safe(
+                    cur,
+                    """
+                    select
+                      name,
+                      setting,
+                      unit,
+                      category,
+                      short_desc,
+                      context,
+                      vartype,
+                      min_val,
+                      max_val,
+                      enumvals,
+                      boot_val,
+                      reset_val,
+                      pending_restart
+                    from pg_settings
+                    order by name
+                    """
+                )
+            return cur.fetchall()
 
 
 @mcp.tool
@@ -265,6 +1369,36 @@ def list_schemas(include_system: bool = False) -> list[str]:
                     """
                 )
             return [r["nspname"] for r in cur.fetchall()]
+
+
+@mcp.tool
+def list_largest_schemas(limit: int = 30) -> list[dict[str, Any]]:
+    """
+    Lists the largest schemas in the current database ordered by total size.
+
+    Args:
+        limit: Maximum number of schemas to return (default: 30).
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            _execute_safe(
+                cur,
+                """
+                select
+                  n.nspname as schema,
+                  sum(pg_total_relation_size(c.oid)) as size_bytes
+                from pg_catalog.pg_namespace n
+                join pg_catalog.pg_class c on n.oid = c.relnamespace
+                where n.nspname not like 'pg_%%'
+                  and n.nspname <> 'information_schema'
+                  and c.relkind in ('r', 'm', 'p') -- tables, matviews, partitioned tables
+                group by n.nspname
+                order by size_bytes desc
+                limit %(limit)s
+                """,
+                {"limit": limit},
+            )
+            return cur.fetchall()
 
 
 @mcp.tool
@@ -367,7 +1501,7 @@ def run_query(sql: str, params_json: str | None = None, max_rows: int | None = N
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params)
+            _execute_safe(cur, sql, params)
             rows_plus_one = _fetch_limited(cur, limit + 1 if limit >= 0 else 1)
             truncated = len(rows_plus_one) > limit
             rows = rows_plus_one[:limit]
@@ -408,253 +1542,13 @@ def explain_query(
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(stmt)
+            _execute_safe(cur, stmt)
             rows = cur.fetchall()
             if fmt == "json":
                 plan = rows[0]["QUERY PLAN"] if rows else None
                 return {"format": "json", "plan": plan}
             text = "\n".join(r["QUERY PLAN"] for r in rows)
             return {"format": "text", "plan": text}
-
-
-@mcp.tool
-def active_sessions(min_duration_seconds: int = 60) -> list[dict[str, Any]]:
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                select
-                  pid,
-                  usename as user,
-                  datname as database,
-                  application_name,
-                  client_addr::text as client_addr,
-                  state,
-                  now() - xact_start as xact_age,
-                  now() - query_start as query_age,
-                  wait_event_type,
-                  wait_event,
-                  left(query, 5000) as query
-                from pg_stat_activity
-                where pid <> pg_backend_pid()
-                  and (
-                    (query_start is not null and now() - query_start > make_interval(secs => %(min_secs)s))
-                    or (xact_start is not null and now() - xact_start > make_interval(secs => %(min_secs)s))
-                  )
-                order by greatest(coalesce(now() - query_start, interval '0'), coalesce(now() - xact_start, interval '0')) desc
-                """,
-                {"min_secs": min_duration_seconds},
-            )
-            return cur.fetchall()
-
-
-@mcp.tool
-def db_locks(min_wait_seconds: int = 0, limit: int = 100) -> list[dict[str, Any]]:
-    return _db_locks(min_wait_seconds=min_wait_seconds, limit=limit)
-
-
-def _db_locks(min_wait_seconds: int, limit: int) -> list[dict[str, Any]]:
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                with blocked as (
-                  select
-                    bl.pid as blocked_pid,
-                    a.usename as blocked_user,
-                    a.datname as blocked_database,
-                    a.application_name as blocked_application_name,
-                    a.client_addr::text as blocked_client_addr,
-                    a.state as blocked_state,
-                    a.wait_event_type as blocked_wait_event_type,
-                    a.wait_event as blocked_wait_event,
-                    now() - a.query_start as blocked_execution_time,
-                    now() - a.xact_start as blocked_xact_age,
-                    now() - coalesce(a.state_change, a.query_start, now()) as blocked_state_age,
-                    left(a.query, 5000) as blocked_query,
-                    bl.locktype,
-                    bl.mode as blocked_lock_mode,
-                    bl.database,
-                    bl.relation,
-                    bl.page,
-                    bl.tuple,
-                    bl.virtualxid,
-                    bl.transactionid,
-                    bl.classid,
-                    bl.objid,
-                    bl.objsubid
-                  from pg_catalog.pg_locks bl
-                  join pg_catalog.pg_stat_activity a on a.pid = bl.pid
-                  where not bl.granted
-                    and bl.pid <> pg_backend_pid()
-                )
-                select
-                  b.blocked_pid,
-                  b.blocked_user,
-                  b.blocked_database,
-                  b.blocked_application_name,
-                  b.blocked_client_addr,
-                  b.blocked_state,
-                  b.blocked_wait_event_type,
-                  b.blocked_wait_event,
-                  b.blocked_query,
-                  b.blocked_execution_time,
-                  b.blocked_state_age as blocked_lock_wait_time,
-                  b.blocked_xact_age,
-                  b.locktype,
-                  b.blocked_lock_mode,
-                  b.relation::regclass::text as locked_relation,
-                  kl.pid as blocking_pid,
-                  ka.usename as blocking_user,
-                  ka.application_name as blocking_application_name,
-                  ka.client_addr::text as blocking_client_addr,
-                  ka.state as blocking_state,
-                  now() - ka.query_start as blocking_execution_time,
-                  now() - ka.xact_start as blocking_xact_age,
-                  left(ka.query, 5000) as blocking_query,
-                  kl.mode as blocking_lock_mode
-                from blocked b
-                join pg_catalog.pg_locks kl
-                  on kl.locktype = b.locktype
-                  and kl.database is not distinct from b.database
-                  and kl.relation is not distinct from b.relation
-                  and kl.page is not distinct from b.page
-                  and kl.tuple is not distinct from b.tuple
-                  and kl.virtualxid is not distinct from b.virtualxid
-                  and kl.transactionid is not distinct from b.transactionid
-                  and kl.classid is not distinct from b.classid
-                  and kl.objid is not distinct from b.objid
-                  and kl.objsubid is not distinct from b.objsubid
-                  and kl.granted
-                  and kl.pid <> b.blocked_pid
-                join pg_catalog.pg_stat_activity ka on ka.pid = kl.pid
-                where ka.pid <> pg_backend_pid()
-                  and b.blocked_state_age >= make_interval(secs => %(min_wait_secs)s)
-                order by b.blocked_state_age desc
-                limit %(limit)s
-                """,
-                {"min_wait_secs": min_wait_seconds, "limit": limit},
-            )
-            return cur.fetchall()
-
-
-@mcp.tool
-def table_sizes(schema: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            if schema:
-                cur.execute(
-                    """
-                    select
-                      n.nspname as schema,
-                      c.relname as table,
-                      pg_total_relation_size(c.oid) as total_size_bytes,
-                      pg_relation_size(c.oid) as heap_size_bytes,
-                      pg_indexes_size(c.oid) as index_size_bytes
-                    from pg_class c
-                    join pg_namespace n on n.oid = c.relnamespace
-                    where c.relkind = 'r'
-                      and n.nspname = %(schema)s
-                    order by pg_total_relation_size(c.oid) desc
-                    limit %(limit)s
-                    """,
-                    {"schema": schema, "limit": limit},
-                )
-            else:
-                cur.execute(
-                    """
-                    select
-                      n.nspname as schema,
-                      c.relname as table,
-                      pg_total_relation_size(c.oid) as total_size_bytes,
-                      pg_relation_size(c.oid) as heap_size_bytes,
-                      pg_indexes_size(c.oid) as index_size_bytes
-                    from pg_class c
-                    join pg_namespace n on n.oid = c.relnamespace
-                    where c.relkind = 'r'
-                      and n.nspname not like 'pg_%%'
-                      and n.nspname <> 'information_schema'
-                    order by pg_total_relation_size(c.oid) desc
-                    limit %(limit)s
-                    """,
-                    {"limit": limit},
-                )
-            return cur.fetchall()
-
-
-@mcp.tool
-def index_usage(schema: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            if schema:
-                cur.execute(
-                    """
-                    select
-                      schemaname as schema,
-                      relname as table,
-                      indexrelname as index,
-                      idx_scan,
-                      idx_tup_read,
-                      idx_tup_fetch,
-                      pg_relation_size(indexrelid) as index_size_bytes
-                    from pg_stat_user_indexes
-                    where schemaname = %(schema)s
-                    order by pg_relation_size(indexrelid) desc
-                    limit %(limit)s
-                    """,
-                    {"schema": schema, "limit": limit},
-                )
-            else:
-                cur.execute(
-                    """
-                    select
-                      schemaname as schema,
-                      relname as table,
-                      indexrelname as index,
-                      idx_scan,
-                      idx_tup_read,
-                      idx_tup_fetch,
-                      pg_relation_size(indexrelid) as index_size_bytes
-                    from pg_stat_user_indexes
-                    order by pg_relation_size(indexrelid) desc
-                    limit %(limit)s
-                    """,
-                    {"limit": limit},
-                )
-            return cur.fetchall()
-
-
-@mcp.tool
-def top_queries(limit: int = 10, order_by: str = "total_time") -> list[dict[str, Any]]:
-    order = order_by.strip().lower()
-    allowed = {"total_time", "mean_time", "calls"}
-    if order not in allowed:
-        raise ValueError(f"order_by must be one of: {sorted(allowed)}")
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    f"""
-                    select
-                      left(query, 5000) as query,
-                      calls,
-                      total_exec_time as total_time,
-                      mean_exec_time as mean_time,
-                      rows
-                    from pg_stat_statements
-                    order by {order} desc
-                    limit %(limit)s
-                    """,
-                    {"limit": limit},
-                )
-                return cur.fetchall()
-            except UndefinedTable:
-                return [
-                    {
-                        "error": "pg_stat_statements is not available",
-                        "hint": "Enable the extension and shared_preload_libraries, then create extension pg_stat_statements.",
-                    }
-                ]
 
 
 def main() -> None:
@@ -669,4 +1563,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

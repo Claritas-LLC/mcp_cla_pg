@@ -23,19 +23,44 @@ Health endpoint:
 
 The MCP server exposes these tools:
 
-- `ping`
-- `server_info`
-- `list_databases`
-- `list_schemas`
-- `list_tables`
-- `describe_table`
-- `run_query`
-- `explain_query`
-- `active_sessions`
-- `db_locks`
-- `table_sizes`
-- `index_usage`
-- `top_queries`
+- `ping`: Health check.
+- `server_info`: Get database version, user, and server settings.
+- `db_stats`: Get database-level statistics (commits, rollbacks, temp files, deadlocks) with optional performance metrics.
+- `analyze_sessions`: Comprehensive session analysis combining active queries, idle sessions, and locks.
+- `analyze_table_health`: Comprehensive table health analysis combining bloat detection, maintenance needs, and autovacuum recommendations.
+- `analyze_indexes`: Identify unused, duplicate, missing, and redundant indexes.
+- `recommend_partitioning`: Suggest tables for partitioning based on size and access patterns.
+- `recommend_materialized_views`: Analyze access patterns and recommend tables for materialized view conversion.
+- `recommend_autovacuum_settings`: Analyze tables and recommend autovacuum settings based on data access patterns.
+- `database_security_performance_metrics`: Analyze security and performance metrics with optimization recommendations.
+- `get_db_parameters`: Retrieve database configuration parameters (GUCs) with optional filtering.
+- `list_databases`: List all available databases and their sizes.
+- `list_schemas`: List schemas in the current database.
+- `list_largest_schemas`: List schemas ranked by total size (tables, indexes, toast).
+- `list_temp_objects`: List temporary schemas with object counts and total size.
+- `list_tables`: List tables in a specific schema.
+- `list_largest_tables`: List the largest tables in a specific schema ranked by size.
+- `describe_table`: Get column details, indexes, and sizes for a table.
+- `run_query`: Execute ad-hoc read-only SQL queries (with row limits).
+- `explain_query`: Generate EXPLAIN plans for query analysis.
+- `create_db_user`: Create a new database user and assign read or read/write privileges (requires `MCP_ALLOW_WRITE=true`).
+- `drop_db_user`: Drop an existing database user (requires `MCP_ALLOW_WRITE=true`).
+- `kill_session`: Terminate a database session by its PID (requires `MCP_ALLOW_WRITE=true`).
+
+### Applying recommendations
+
+Several tools (for example `analyze_table_health`, `recommend_autovacuum_settings`, and `database_security_performance_metrics`) generate maintenance and tuning recommendations such as `VACUUM`, `ALTER TABLE ... SET (autovacuum_*)`, or changes to `postgresql.conf` parameters. These tools are **read-only**:
+
+- They never execute `VACUUM`, `VACUUM FULL`, `ANALYZE`, `ALTER TABLE`, or `ALTER SYSTEM`.
+- They do not modify `postgresql.conf` or any database settings.
+- They only return suggested commands and configuration values that you can apply elsewhere.
+
+To actually implement the recommendations you must:
+
+- Review the suggested SQL or configuration changes.
+- Apply them using your normal administration channel (psql, pgAdmin, migration scripts, or a separate write-enabled workflow).
+
+Even when `MCP_ALLOW_WRITE=true`, this server only exposes a very small set of write-capable tools (`create_db_user`, `drop_db_user`, `kill_session`) and does **not** provide a generic “apply recommendations” or “run arbitrary maintenance SQL” tool.
 
 ## How to Use
 
@@ -54,6 +79,8 @@ Basic connectivity:
 
 - “Using `postgres_readonly`, call `ping` and show the result.”
 - “Using `postgres_readonly`, call `server_info` and summarize database/user/version.”
+- “Using `postgres_readonly`, call `db_stats` for the current database and summarize activity (commits, temp files, deadlocks).”
+- “Using `postgres_readonly`, call `get_db_parameters(pattern='max_connections|shared_buffers')` to check current capacity settings.”
 
 Schema discovery:
 
@@ -80,6 +107,8 @@ Explain plan:
 
 Active session triage:
 
+- “Using `postgres_readonly`, call `list_active_queries` and summarize the currently executing SQL statements.”
+- “Using `postgres_readonly`, call `list_idle_sessions(min_idle_seconds=300)` to find long-running idle connections.”
 - “Using `postgres_readonly`, call `active_sessions(min_duration_seconds=300)` and summarize what looks stuck.”
 
 Lock triage:
@@ -88,7 +117,27 @@ Lock triage:
 
 Capacity review:
 
+- “Using `postgres_readonly`, call `list_largest_schemas(limit=30)` to identify the biggest schemas.”
+- “Using `postgres_readonly`, call `list_temp_objects` to check for large or numerous temporary objects.”
+- “Using `postgres_readonly`, call `list_largest_tables(schema='public', limit=30)` to find the largest tables in the public schema.”
 - “Using `postgres_readonly`, call `table_sizes(limit=20)` and `index_usage(limit=20)`, then highlight the biggest objects.”
+- “Using `postgres_readonly`, call `analyze_indexes(schema='public')` to find optimization opportunities.”
+- “Using `postgres_readonly`, call `recommend_partitioning(min_size_gb=1.0)` to identify candidates for table partitioning.”
+- “Using `postgres_readonly`, call `recommend_materialized_views(schema='public')` to find tables suitable for materialized view conversion.”
+- “Using `postgres_readonly`, call `recommend_autovacuum_settings(min_size_mb=50)` to get autovacuum tuning recommendations.”
+- “Using `postgres_readonly`, call `database_security_performance_metrics()` to analyze security and performance issues with optimization commands.”
+- “Using `postgres_readonly`, call `analyze_table_health(schema='public')` to get comprehensive table health analysis including bloat, maintenance, and autovacuum recommendations.”
+- “Using `postgres_readonly`, call `analyze_sessions()` to get comprehensive session analysis including active queries, idle sessions, and lock information.”
+- “Using `postgres_readonly`, call `check_bloat(limit=50)` and summarize the top 10 most bloated objects and their fix commands.”
+- “Using `postgres_readonly`, call `maintenance_stats` and identify tables with high dead tuple counts or freeze risk.”
+
+User management (requires maintenance role):
+
+- “Using `postgres_maintenance`, call `create_db_user(username='lenexa_analyst', password='change_me_123', privileges='read', database='lenexa')`”
+
+- “Using `postgres_maintenance`, call `drop_db_user(username='old_analyst')`”
+
+- “Using `postgres_maintenance`, call `kill_session(pid=1234)` to terminate a stuck session.”
 
 ## Requirements
 
@@ -100,8 +149,7 @@ Capacity review:
 ### Development (optional)
 
 - Python 3.12+
-
-Note: local `pip install` can fail on some Windows setups due to a broken TLS CA bundle path. Docker builds are not affected.
+- Windows: if `pip install` fails with a TLS CA bundle error, use `python pipw.py install -r requirements.txt`.
 
 ## Configuration
 
@@ -122,11 +170,14 @@ Example:
   - `false`: only read-only queries are allowed (SELECT/WITH/SHOW/EXPLAIN)
   - `true`: write and DDL statements are allowed
 - `MCP_MAX_ROWS` (default: `500`): default max rows returned by `run_query`
+- `MCP_STATEMENT_TIMEOUT_MS` (default: `30000`): session-level query execution timeout in milliseconds.
 
 ### Connection Pool
 
 - `MCP_POOL_MIN_SIZE` (default: `1`)
 - `MCP_POOL_MAX_SIZE` (default: `5`)
+- `MCP_POOL_TIMEOUT` (default: `30.0`): time in seconds to wait for a connection from the pool.
+- `MCP_POOL_MAX_WAITING` (default: `10`): maximum number of requests waiting for a connection.
 
 ### Server Transport
 
@@ -159,91 +210,152 @@ If you only need to validate Bearer tokens without a full OAuth flow:
 
 ## Deployment Procedures
 
-### Build the Docker image
+### 1. Docker (Recommended for production/remote)
 
-From this directory:
-
+#### Build the image
 ```bash
 docker build -t mcp-postgres-server .
 ```
 
-### Run (read-only, recommended)
+#### Run with Docker Compose (Easier local management)
+Create a `.env` file or set variables in your shell, then:
+```bash
+docker-compose up -d
+```
 
+#### Run with Docker directly
 ```bash
 docker run --rm \
   -p 8000:8000 \
   -e DATABASE_URL="postgresql://mcp_readonly:change_me@your_db_host:5432/your_db" \
-  -e MCP_ALLOW_WRITE=false \
-  --name mcp-postgres-readonly \
+  --name mcp-postgres \
   mcp-postgres-server
 ```
 
-### Run (maintenance / writes enabled)
-
-Use a separate role and separate port:
+### 2. UV (Recommended for local Python development)
+If you have [uv](https://github.com/astral-sh/uv) installed:
 
 ```bash
-docker run --rm \
-  -p 8001:8000 \
-  -e DATABASE_URL="postgresql://mcp_maintenance:change_me@your_db_host:5432/your_db" \
-  -e MCP_ALLOW_WRITE=true \
-  --name mcp-postgres-maint \
-  mcp-postgres-server
+# Run the server directly
+uv run mcp-postgres
 ```
 
-### Verify
+Or using `uvx` (ephemeral run):
+```bash
+uvx --from . mcp-postgres
+```
 
-- Health: `http://localhost:8000/health` should return `ok`
-- MCP endpoint: `http://localhost:8000/mcp`
+### 3. NPX (For Node.js users)
+You can run the server using `npx` from the project root:
+
+```bash
+npx .
+```
+*(Note: Requires Python 3.12+ to be installed on your system)*
+
+### 4. Cloud Deployment (Azure & AWS)
+
+Infrastructure templates are provided in the `deploy/` directory.
+
+#### Azure Container Apps (ACA)
+Using the Azure CLI:
+```bash
+# Login and set your subscription
+az login
+
+# Create a resource group
+az group create --name mcp-postgres-rg --location eastus
+
+# Deploy using the Bicep template
+az deployment group create \
+  --resource-group mcp-postgres-rg \
+  --template-file deploy/azure-aca.bicep \
+  --parameters \
+    containerImage="your-registry.azurecr.io/mcp-postgres:latest" \
+    databaseUrl="your-db-url"
+```
+
+#### AWS ECS Fargate
+Using the AWS CLI:
+```bash
+# Deploy the CloudFormation stack
+aws cloudformation create-stack \
+  --stack-name mcp-postgres-stack \
+  --template-body file://deploy/aws-ecs.yaml \
+  --capabilities CAPABILITY_IAM \
+  --parameters \
+    ParameterKey=VpcId,ParameterValue=vpc-xxxxxx \
+    ParameterKey=SubnetIds,ParameterValue=subnet-xxxx\,subnet-yyyy \
+    ParameterKey=ContainerImage,ParameterValue=xxxx.dkr.ecr.us-east-1.amazonaws.com/mcp-postgres:latest \
+    ParameterKey=DatabaseUrl,ParameterValue="your-db-url"
+```
+
+### 5. Verification
+- Health: `http://localhost:8000/health` should return `ok`.
+- MCP endpoint: `http://localhost:8000/mcp`.
+
+### 6. Accessing the Remote Server (Azure)
+
+Once deployed to Azure Container Apps, the server will be available over HTTPS.
+
+#### Get the URL
+You can find the URL (FQDN) in the Azure Portal under the **Overview** tab of your Container App, or via CLI:
+```bash
+az containerapp show \
+  --name mcp-postgres-server \
+  --resource-group mcp-postgres-rg \
+  --query properties.configuration.ingress.fqdn \
+  --output tsv
+```
+
+The full MCP endpoint will be:
+`https://<your-fqdn>/mcp`
+
+#### Configure your client
+In your MCP client (e.g., Codex `config.toml`), use the HTTPS URL:
+```toml
+[mcp_servers.azure_postgres]
+url = "https://mcp-postgres-server.your-id.region.azurecontainerapps.io/mcp"
+enabled = true
+# If you enabled authentication (OIDC/JWT), provide the token
+bearer_token_env_var = "AZURE_MCP_TOKEN"
+```
+
+### Docker Health Checks
+
+The provided `Dockerfile` includes a built-in health check that monitors the `/health` endpoint. When running in environments like Docker Compose or Kubernetes, the container status will automatically reflect the health of the MCP server.
 
 ## VS Code Setup
 
-To use this server from VS Code, you need a VS Code extension that supports MCP servers over Streamable HTTP. Configure the extension to point at your running MCP endpoint:
+To use this server from VS Code, you need a VS Code extension that supports MCP servers over Streamable HTTP. 
 
-- `http://localhost:8000/mcp` (read-only)
-- `http://localhost:8001/mcp` (maintenance, optional)
+### 1. Codex – OpenAI’s coding agent
 
-### Codex – OpenAI’s coding agent
+Codex reads MCP servers from `~/.codex/config.toml`. 
 
-Codex reads MCP servers from:
-
-- `~/.codex/config.toml`
-
-In the Codex extension:
-
-- Open Codex panel
-- Gear icon → MCP settings → Open `config.toml`
-
-Add:
-
+#### For Local Deployment
 ```toml
-[mcp_servers.postgres_readonly]
+[mcp_servers.postgres_local]
 url = "http://localhost:8000/mcp"
 enabled = true
-tool_timeout_sec = 60
-startup_timeout_sec = 10
-# If authentication is enabled, provide the token via an environment variable
-bearer_token_env_var = "POSTGRES_MCP_TOKEN"
 ```
 
-If you run the maintenance server:
-
+#### For Azure Deployment (Remote)
+1. Get your Azure FQDN (see [Accessing the Remote Server (Azure)](#6-accessing-the-remote-server-azure)).
+2. Add to `config.toml`:
 ```toml
-[mcp_servers.postgres_maintenance]
-url = "http://localhost:8001/mcp"
+[mcp_servers.postgres_azure]
+url = "https://your-app.region.azurecontainerapps.io/mcp"
 enabled = true
+# If authentication is enabled, provide the token via an environment variable
+bearer_token_env_var = "AZURE_MCP_TOKEN"
 ```
 
-### Other VS Code MCP extensions
-
-If you are using a different VS Code extension with MCP support, look for a setting like “MCP Servers” or “Tool Servers” and add an HTTP server entry with:
-
-- Name: `postgres_readonly`
-- URL: `http://localhost:8000/mcp`
-
-If the extension supports per-server tool allowlists, you can restrict it to:
-
-- `ping`, `server_info`, `list_schemas`, `list_tables`, `describe_table`, `run_query`, `explain_query`, `active_sessions`, `db_locks`, `table_sizes`, `index_usage`, `top_queries`
+### 2. Other VS Code Extensions
+If you are using other extensions (like Cursor or generic MCP clients), look for "MCP Servers" in settings and add:
+- **Type**: HTTP / Streamable HTTP
+- **URL**: `https://your-app.region.azurecontainerapps.io/mcp`
+- **Auth**: Add `Authorization: Bearer <your-token>` header if required.
 
 ## PostgreSQL Role Recommendations
 
@@ -303,7 +415,20 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
 ### Local pip install fails with TLS CA bundle error (Windows)
 
-If you see an error like “could not find a suitable TLS CA certificate bundle”, use Docker-based deployment instead of local installs, or repair your Python/pip certificate configuration.
+Use `python pipw.py install -r requirements.txt`, which repairs common cases where `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` point to a missing file for that process. If it still fails, use Docker-based deployment or repair your Python/pip certificate configuration.
+
+## Security & Scalability Best Practices
+
+### Security Hardening
+- **Least Privilege**: Always use a read-only PostgreSQL role for `mcp_readonly` (see [PostgreSQL Role Recommendations](#postgresql-role-recommendations)).
+- **Authentication**: Enable OIDC or JWT verification for remote endpoints.
+- **Network Isolation**: Run the MCP server in a private network, exposing it only via an authenticated reverse proxy (e.g., Caddy, Nginx).
+- **Statement Timeouts**: Keep `MCP_STATEMENT_TIMEOUT_MS` low (e.g., 30s) to prevent resource exhaustion from complex queries.
+
+### Scalability Tuning
+- **Connection Pooling**: Tune `MCP_POOL_MAX_SIZE` based on your expected concurrency and DB capacity.
+- **Row Limits**: Use `MCP_MAX_ROWS` to prevent large result sets from consuming excessive memory in the MCP server or client.
+- **Monitoring**: Check logs for "BLOCKED write attempt" warnings to identify unauthorized usage patterns.
 
 ## FAQ
 

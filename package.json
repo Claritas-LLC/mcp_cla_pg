@@ -1,0 +1,21 @@
+{
+  "name": "mcp-postgres",
+  "version": "1.0.0",
+  "description": "PostgreSQL MCP Server for DBA-oriented tools",
+  "main": "bin/mcp-postgres.js",
+  "bin": {
+    "mcp-postgres": "bin/mcp-postgres.js"
+  },
+  "scripts": {
+    "start": "node bin/mcp-postgres.js"
+  },
+  "keywords": [
+    "mcp",
+    "postgres",
+    "postgresql",
+    "dba",
+    "tools"
+  ],
+  "author": "Harry Valdez",
+  "license": "MIT"
+}

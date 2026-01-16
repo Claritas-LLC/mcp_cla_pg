@@ -1,0 +1,32 @@
+services:
+  mcp-postgres:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/postgres}
+      - MCP_ALLOW_WRITE=${MCP_ALLOW_WRITE:-false}
+      - MCP_TRANSPORT=http
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8000
+      # Optional OAuth/JWT settings
+      - FASTMCP_AUTH_TYPE=${FASTMCP_AUTH_TYPE:-}
+      - FASTMCP_OIDC_CONFIG_URL=${FASTMCP_OIDC_CONFIG_URL:-}
+      - FASTMCP_OIDC_CLIENT_ID=${FASTMCP_OIDC_CLIENT_ID:-}
+      - FASTMCP_OIDC_CLIENT_SECRET=${FASTMCP_OIDC_CLIENT_SECRET:-}
+      - FASTMCP_OIDC_BASE_URL=${FASTMCP_OIDC_BASE_URL:-}
+    restart: unless-stopped
+
+  postgres96:
+    image: postgres:9.6
+    ports:
+      - "55432:5432"
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=mcp_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mcp_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
