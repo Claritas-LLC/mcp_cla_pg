@@ -10,7 +10,7 @@ This server exposes a suite of DBA-grade tools to inspect schemas, analyze perfo
 - **Performance Analysis**: Detect table bloat, missing indexes, and lock contention.
 - **Security Audits**: Analyze database privileges and security settings.
 - **Safe Execution**: Read-only by default, with optional write capabilities for specific maintenance tasks.
-- **Multiple Transports**: Supports `http` (SSE), `stdio`, and `https` for seamless integration.
+- **Multiple Transports**: Supports `http` (uses SSE) and `stdio`. HTTPS is supported via SSL configuration variables.
 - **Secure Authentication**: Built-in support for **Azure AD (Microsoft Entra ID)** and standard token auth.
 - **HTTPS Support**: Native SSL/TLS support for secure remote connections.
 - **Broad Compatibility**: Fully tested with **PostgreSQL 9.6+**.
@@ -132,7 +132,7 @@ The server is configured entirely via environment variables.
 | `DATABASE_URL` | Full PostgreSQL connection string | *Required* |
 | `MCP_HOST` | Host to bind the server to | `0.0.0.0` |
 | `MCP_PORT` | Port to listen on | `8000` |
-| `MCP_TRANSPORT` | Transport mode: `http`, `sse`, or `stdio` | `http` |
+| `MCP_TRANSPORT` | Transport mode: `http` (uses SSE) or `stdio` | `http` |
 | `MCP_ALLOW_WRITE` | Enable write tools (`create_db_user`, etc.) | *Required* |
 | `MCP_STATEMENT_TIMEOUT_MS` | Query execution timeout in milliseconds | `120000` |
 
