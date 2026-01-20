@@ -2,15 +2,18 @@
 name = "mcp-postgres"
 version = "0.1.0"
 description = "PostgreSQL MCP Server for DBA-oriented tools"
+requires-python = ">=3.12"
 authors = [
     { name = "Harry Valdez" }
 ]
 dependencies = [
-    "fastmcp[auth]<3",
+    "fastmcp<3",
     "psycopg[binary,pool]>=3.2.0",
     "starlette>=0.36.0",
 ]
-requires-python = ">=3.12"
+
+[tool.hatch.build.targets.wheel]
+include = ["server.py"]
 
 [project.scripts]
 mcp-postgres = "server:main"

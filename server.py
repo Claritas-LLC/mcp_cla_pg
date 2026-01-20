@@ -11,7 +11,7 @@ from psycopg.errors import UndefinedTable
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, JSONResponse
 
 # Configure structured logging
 logging.basicConfig(
@@ -66,6 +66,42 @@ def _get_auth() -> Any:
             audience=os.environ.get("FASTMCP_JWT_AUDIENCE"),
         )
 
+    # Azure AD (Microsoft Entra ID) simplified configuration
+    if auth_type.lower() == "azure-ad":
+        tenant_id = os.environ.get("FASTMCP_AZURE_AD_TENANT_ID")
+        client_id = os.environ.get("FASTMCP_AZURE_AD_CLIENT_ID")
+        
+        if not all([tenant_id, client_id]):
+            raise RuntimeError(
+                "Azure AD authentication requires FASTMCP_AZURE_AD_TENANT_ID and FASTMCP_AZURE_AD_CLIENT_ID"
+            )
+            
+        # Determine if we should use full OIDC flow or just JWT verification
+        # If client_secret and base_url are provided, we use OIDC Proxy
+        client_secret = os.environ.get("FASTMCP_AZURE_AD_CLIENT_SECRET")
+        base_url = os.environ.get("FASTMCP_AZURE_AD_BASE_URL")
+        
+        config_url = f"https://login.microsoftonline.com/{tenant_id}/v2.0/.well-known/openid-configuration"
+        
+        if client_secret and base_url:
+            from fastmcp.server.auth.providers.oidc import OIDCProxy
+            return OIDCProxy(
+                config_url=config_url,
+                client_id=client_id,
+                client_secret=client_secret,
+                base_url=base_url,
+                audience=os.environ.get("FASTMCP_AZURE_AD_AUDIENCE", client_id),
+            )
+        else:
+            from fastmcp.server.auth.providers.jwt import JWTVerifier
+            jwks_uri = f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys"
+            issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
+            return JWTVerifier(
+                jwks_uri=jwks_uri,
+                issuer=issuer,
+                audience=os.environ.get("FASTMCP_AZURE_AD_AUDIENCE", client_id),
+            )
+
     return auth_type
 
 
@@ -107,7 +143,10 @@ if not DATABASE_URL:
         "Missing DATABASE_URL or PGHOST/PGUSER/PGDATABASE environment variables"
     )
 
-ALLOW_WRITE = _env_bool("MCP_ALLOW_WRITE", True)
+if os.environ.get("MCP_ALLOW_WRITE") is None:
+    raise RuntimeError("MCP_ALLOW_WRITE environment variable is required (e.g. 'true' or 'false')")
+
+ALLOW_WRITE = _env_bool("MCP_ALLOW_WRITE", False)
 DEFAULT_MAX_ROWS = _env_int("MCP_MAX_ROWS", 500)
 POOL_MIN_SIZE = _env_int("MCP_POOL_MIN_SIZE", 1)
 POOL_MAX_SIZE = _env_int("MCP_POOL_MAX_SIZE", 5)
@@ -232,6 +271,19 @@ def _execute_safe(cur, sql: Any, params: Any = None) -> None:
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_request: Request) -> PlainTextResponse:
     return PlainTextResponse("ok")
+
+
+@mcp.custom_route("/", methods=["GET"])
+async def root(_request: Request) -> JSONResponse:
+    return JSONResponse({
+        "status": "online",
+        "message": "PostgreSQL MCP Server is running",
+        "endpoints": {
+            "mcp": "/mcp (MCP/SSE protocol endpoint)",
+            "health": "/health",
+            "info": "use 'server_info' tool via MCP"
+        }
+    })
 
 
 @mcp.tool
@@ -642,7 +694,7 @@ def analyze_table_health(
                 where c.relkind = 'r'
                   and n.nspname not in ('pg_catalog', 'information_schema')
                   and (%(schema)s::text is null or n.nspname = %(schema)s::text)
-                  and pg_relation_size(c.oid) > %(min_size)s * 1024 * 1024
+                  and pg_relation_size(c.oid) > %(min_size)s::bigint * 1024 * 1024
                 order by pg_relation_size(c.oid) desc
                 limit %(limit)s
                 """,
@@ -853,24 +905,46 @@ def analyze_table_health(
 
 
 @mcp.tool
-def database_security_performance_metrics(cache_hit_threshold: int = 90, connection_usage_threshold: float = 0.8) -> dict[str, Any]:
+def database_security_performance_metrics(
+    cache_hit_threshold: int | None = None,
+    connection_usage_threshold: float | None = None,
+    profile: str = "oltp"
+) -> dict[str, Any]:
     """
     Analyzes database security and performance metrics, identifying issues and providing optimization commands.
     
     Args:
-        cache_hit_threshold: Minimum acceptable cache hit ratio percentage (default: 90).
-        connection_usage_threshold: Maximum acceptable connection usage ratio (default: 0.8).
+        cache_hit_threshold: Minimum acceptable cache hit ratio percentage. If None, tuned by profile.
+        connection_usage_threshold: Maximum acceptable connection usage ratio. If None, tuned by profile.
+        profile: Workload profile to tune thresholds, e.g. "oltp" or "olap".
     
     Returns:
         Dictionary containing security metrics, performance metrics, issues found, and recommended fixes.
     """
+    # Profile-based threshold logic
+    profile_value = (profile or "oltp").lower()
+    if profile_value == "olap":
+        default_cache_threshold = 80
+        default_conn_threshold = 0.9
+        checkpoint_req_threshold = 50
+        temp_file_threshold = 500
+    else:  # Default to oltp
+        default_cache_threshold = 95
+        default_conn_threshold = 0.7
+        checkpoint_req_threshold = 20
+        temp_file_threshold = 50
+
+    cache_hit_limit = cache_hit_threshold if cache_hit_threshold is not None else default_cache_threshold
+    conn_usage_limit = connection_usage_threshold if connection_usage_threshold is not None else default_conn_threshold
+
     with pool.connection() as conn:
         with conn.cursor() as cur:
             results = {
                 "security_metrics": {},
                 "performance_metrics": {},
                 "issues_found": [],
-                "recommended_fixes": []
+                "recommended_fixes": [],
+                "profile_applied": profile_value
             }
 
             # 1. SSL/TLS Configuration
@@ -938,17 +1012,26 @@ def database_security_performance_metrics(cache_hit_threshold: int = 90, connect
                     """
                 )
                 user_security = cur.fetchall()
-            results["security_metrics"]["user_accounts"] = user_security
+            
+            # Summarize users to avoid truncation
+            superusers = [u for u in user_security if u["usesuper"]]
+            users_without_passwords = [u for u in user_security if not u["has_password"]]
+            
+            results["security_metrics"]["user_accounts_summary"] = {
+                "total_users": len(user_security),
+                "superuser_count": len(superusers),
+                "no_password_count": len(users_without_passwords),
+                "superusers": [u["user"] for u in superusers],
+                "users_without_passwords": [u["user"] for u in users_without_passwords][:10] # Show first 10
+            }
 
             # Check for superusers and password issues
-            superusers = [u for u in user_security if u["usesuper"]]
             if len(superusers) > 1:
                 results["issues_found"].append(f"Multiple superusers found: {[u['user'] for u in superusers]}")
                 results["recommended_fixes"].append("Review superuser privileges and limit to minimum required")
 
-            users_without_passwords = [u for u in user_security if not u["has_password"]]
             if users_without_passwords:
-                results["issues_found"].append(f"Users without passwords: {[u['user'] for u in users_without_passwords]}")
+                results["issues_found"].append(f"Users without passwords: {len(users_without_passwords)} users detected")
                 results["recommended_fixes"].append("Set strong passwords for all user accounts")
 
             # 3. Cache Hit Ratio Analysis
@@ -973,10 +1056,10 @@ def database_security_performance_metrics(cache_hit_threshold: int = 90, connect
             results["performance_metrics"]["cache_hit_ratios"] = cache_metrics
 
             # Identify databases with poor cache hit ratios
-            poor_cache_databases = [db for db in cache_metrics if db["cache_hit_ratio"] < cache_hit_threshold]
+            poor_cache_databases = [db for db in cache_metrics if db["cache_hit_ratio"] < cache_hit_limit]
             if poor_cache_databases:
                 results["issues_found"].append(f"Low cache hit ratios: {[f'{db['database']} ({db['cache_hit_ratio']}%)' for db in poor_cache_databases]}")
-                results["recommended_fixes"].append(f"Consider increasing shared_buffers for better cache performance (threshold: {cache_hit_threshold}%)")
+                results["recommended_fixes"].append(f"Consider increasing shared_buffers for better cache performance (threshold: {cache_hit_limit}% for {profile_value})")
 
             # 4. Connection Pool and Limits
             _execute_safe(
@@ -994,9 +1077,9 @@ def database_security_performance_metrics(cache_hit_threshold: int = 90, connect
             connection_metrics = cur.fetchone()
             results["performance_metrics"]["connection_usage"] = connection_metrics
 
-            if connection_metrics["active_connections"] > connection_metrics["max_connections"] * connection_usage_threshold:
+            if connection_metrics["active_connections"] > connection_metrics["max_connections"] * conn_usage_limit:
                 results["issues_found"].append(f"High connection usage: {connection_metrics['active_connections']}/{connection_metrics['max_connections']} connections active")
-                results["recommended_fixes"].append(f"Consider increasing max_connections or implementing connection pooling (threshold: {int(connection_usage_threshold*100)}%)")
+                results["recommended_fixes"].append(f"Consider increasing max_connections or implementing connection pooling (threshold: {int(conn_usage_limit*100)}% for {profile_value})")
 
             # 5. WAL and Checkpoint Performance
             _execute_safe(
@@ -1021,9 +1104,9 @@ def database_security_performance_metrics(cache_hit_threshold: int = 90, connect
             checkpoint_metrics = cur.fetchone()
             results["performance_metrics"]["checkpoint_stats"] = checkpoint_metrics
 
-            if checkpoint_metrics["checkpoint_request_ratio"] > 30:
+            if checkpoint_metrics["checkpoint_request_ratio"] > checkpoint_req_threshold:
                 results["issues_found"].append(f"High checkpoint request ratio: {checkpoint_metrics['checkpoint_request_ratio']}%")
-                results["recommended_fixes"].append("Consider increasing checkpoint_segments or checkpoint_timeout to reduce checkpoint frequency")
+                results["recommended_fixes"].append(f"Consider increasing checkpoint_segments or checkpoint_timeout to reduce frequency (threshold: {checkpoint_req_threshold}% for {profile_value})")
 
             # 6. Lock and Deadlock Analysis
             _execute_safe(
@@ -1045,9 +1128,9 @@ def database_security_performance_metrics(cache_hit_threshold: int = 90, connect
                 results["issues_found"].append(f"Deadlocks detected: {lock_metrics['deadlocks']}")
                 results["recommended_fixes"].append("Review application locking patterns and transaction isolation levels")
 
-            if lock_metrics["temp_files"] > 100:
+            if lock_metrics["temp_files"] > temp_file_threshold:
                 results["issues_found"].append(f"High temp file usage: {lock_metrics['temp_files']} files, {lock_metrics['temp_bytes']} bytes")
-                results["recommended_fixes"].append("Consider increasing work_mem to reduce temporary file creation")
+                results["recommended_fixes"].append(f"Consider increasing work_mem to reduce temporary file creation (threshold: {temp_file_threshold} for {profile_value})")
 
             # 7. Extension Security
             _execute_safe(
@@ -1082,22 +1165,178 @@ def database_security_performance_metrics(cache_hit_threshold: int = 90, connect
                 results["recommended_fixes"].append("# ssl_ca_file = 'root.crt'")
 
             if poor_cache_databases:
-                results["recommended_fixes"].append(f"# Increase shared_buffers (currently {next((s['setting'] for s in ssl_settings if s['name'] == 'shared_buffers'), 'unknown')}):")
+                results["recommended_fixes"].append("# Increase shared_buffers:")
                 results["recommended_fixes"].append("# shared_buffers = 256MB  # Adjust based on available RAM")
 
-            if connection_metrics["active_connections"] > connection_metrics["max_connections"] * 0.8:
+            if connection_metrics["active_connections"] > connection_metrics["max_connections"] * conn_usage_limit:
                 results["recommended_fixes"].append(f"# Increase max_connections (currently {connection_metrics['max_connections']}):")
                 results["recommended_fixes"].append("# max_connections = 200  # Adjust based on workload")
 
-            if checkpoint_metrics["checkpoint_request_ratio"] > 30:
+            if checkpoint_metrics["checkpoint_request_ratio"] > checkpoint_req_threshold:
                 results["recommended_fixes"].append("# Optimize checkpoint settings:")
                 results["recommended_fixes"].append("# checkpoint_timeout = 15min")
                 results["recommended_fixes"].append("# max_wal_size = 4GB")
                 results["recommended_fixes"].append("# min_wal_size = 1GB")
 
-            if lock_metrics["temp_files"] > 100:
+            if lock_metrics["temp_files"] > temp_file_threshold:
                 results["recommended_fixes"].append("# Increase work_mem (use caution, affects per-operation memory):")
                 results["recommended_fixes"].append("# work_mem = 64MB  # Adjust based on concurrent connections")
+
+            return results
+
+
+@mcp.tool
+def recommend_partitioning(
+    min_size_gb: float = 1.0,
+    schema: str | None = None,
+    limit: int = 50
+) -> dict[str, Any]:
+    """
+    Suggests tables for partitioning based primarily on size and basic access patterns.
+    
+    Args:
+        min_size_gb: Minimum total table size in gigabytes to consider as a candidate.
+        schema: Optional schema name to filter tables. If None, all user schemas are considered.
+        limit: Maximum number of candidate tables to return.
+    
+    Returns:
+        Dictionary containing a summary and a list of candidate tables with size and access metrics.
+    """
+    if min_size_gb <= 0:
+        raise ValueError("min_size_gb must be positive")
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+
+    size_bytes_threshold = int(min_size_gb * 1024 * 1024 * 1024)
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            _execute_safe(
+                cur,
+                """
+                with params as (
+                  select current_setting('block_size')::int as bs
+                )
+                select
+                  c.oid,
+                  n.nspname as schema,
+                  c.relname as table,
+                  (c.relpages::bigint * p.bs::bigint) as approx_size_bytes
+                from pg_class c
+                join pg_namespace n on n.oid = c.relnamespace
+                cross join params p
+                where c.relkind = 'r'
+                  and n.nspname not in ('pg_catalog', 'information_schema')
+                  and (%(schema)s::text is null or n.nspname = %(schema)s::text)
+                order by (c.relpages::bigint * p.bs::bigint) desc
+                limit %(limit)s
+                """,
+                {
+                    "schema": schema,
+                    "limit": limit,
+                },
+            )
+            base_rows = cur.fetchall()
+
+            results: dict[str, Any] = {
+                "summary": {
+                    "min_size_gb": float(min_size_gb),
+                    "schema_filter": schema,
+                    "total_candidates": 0,
+                },
+                "candidates": [],
+            }
+
+            if not base_rows:
+                return results
+
+            filtered_rows = [
+                row for row in base_rows
+                if row["approx_size_bytes"] >= size_bytes_threshold
+            ]
+            results["summary"]["total_candidates"] = len(filtered_rows)
+
+            for row in filtered_rows:
+                oid = row["oid"]
+
+                _execute_safe(
+                    cur,
+                    """
+                    select
+                      s.n_live_tup as live_rows,
+                      s.n_dead_tup as dead_rows,
+                      s.seq_scan,
+                      s.idx_scan,
+                      s.n_tup_ins as inserts,
+                      s.n_tup_upd as updates,
+                      s.n_tup_del as deletes
+                    from pg_stat_user_tables s
+                    where s.relid = %(oid)s
+                    """,
+                    {"oid": oid},
+                )
+                stats = cur.fetchone() or {}
+
+                approx_size_gb = row["approx_size_bytes"] / float(1024 * 1024 * 1024)
+                live_rows = stats.get("live_rows") or 0
+                dead_rows = stats.get("dead_rows") or 0
+                seq_scan = stats.get("seq_scan") or 0
+                idx_scan = stats.get("idx_scan") or 0
+                inserts = stats.get("inserts") or 0
+                updates = stats.get("updates") or 0
+                deletes = stats.get("deletes") or 0
+
+                total_reads = seq_scan + idx_scan
+                total_writes = inserts + updates + deletes
+
+                if total_reads > 0 or total_writes > 0:
+                    if total_reads >= 10 * max(total_writes, 1):
+                        workload_pattern = "read_heavy"
+                    elif total_writes >= 5 * max(total_reads, 1):
+                        workload_pattern = "write_heavy"
+                    else:
+                        workload_pattern = "mixed"
+                else:
+                    workload_pattern = "unknown"
+
+                if approx_size_gb >= 10.0 or live_rows >= 100_000_000:
+                    benefit = "high"
+                elif approx_size_gb >= 1.0 or live_rows >= 10_000_000:
+                    benefit = "medium"
+                else:
+                    benefit = "low"
+
+                notes_parts = []
+                if benefit == "high":
+                    notes_parts.append("Very large table; partitioning likely to improve maintenance and query performance")
+                elif benefit == "medium":
+                    notes_parts.append("Large table; partitioning may help for time-based or tenant-based queries")
+                else:
+                    notes_parts.append("Borderline size for partitioning; consider only if query patterns benefit")
+
+                if workload_pattern == "read_heavy":
+                    notes_parts.append("Read-heavy workload")
+                elif workload_pattern == "write_heavy":
+                    notes_parts.append("Write-heavy workload")
+                elif workload_pattern == "mixed":
+                    notes_parts.append("Balanced read/write workload")
+
+                candidate = {
+                    "schema": row["schema"],
+                    "table": row["table"],
+                    "approx_size_gb": round(approx_size_gb, 3),
+                    "live_rows": live_rows,
+                    "dead_rows": dead_rows,
+                    "seq_scan": seq_scan,
+                    "idx_scan": idx_scan,
+                    "total_reads": total_reads,
+                    "total_writes": total_writes,
+                    "workload_pattern": workload_pattern,
+                    "estimated_partitioning_benefit": benefit,
+                    "notes": "; ".join(notes_parts),
+                }
+
+                results["candidates"].append(candidate)
 
             return results
 
@@ -1300,9 +1539,6 @@ def kill_session(pid: int) -> dict[str, Any]:
             }
 
 
-@mcp.tool
-def ping() -> dict[str, Any]:
-    return {"ok": True}
 
 
 @mcp.tool
@@ -1486,6 +1722,226 @@ def list_tables(schema: str = "public") -> list[dict[str, Any]]:
 
 
 @mcp.tool
+def analyze_indexes(schema: str | None = None, limit: int = 50) -> dict[str, Any]:
+    """
+    Identify unused, duplicate, missing, and redundant indexes.
+    
+    Args:
+        schema: Optional schema name to filter.
+        limit: Maximum number of rows to return for each category.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            results = {
+                "unused_indexes": [],
+                "duplicate_indexes": [],
+                "missing_indexes": [],
+                "redundant_indexes": []
+            }
+
+            # 1. Unused Indexes
+            _execute_safe(
+                cur,
+                """
+                select
+                  schemaname as schema,
+                  relname as table,
+                  indexrelname as index,
+                  pg_size_pretty(pg_relation_size(i.indexrelid)) as size,
+                  idx_scan as scans
+                from pg_stat_user_indexes i
+                join pg_index using (indexrelid)
+                where schemaname not in ('pg_catalog', 'information_schema')
+                  and (%(schema)s::text is null or schemaname = %(schema)s::text)
+                  and indisunique = false
+                  and idx_scan = 0
+                order by pg_relation_size(i.indexrelid) desc
+                limit %(limit)s
+                """,
+                {"schema": schema, "limit": limit}
+            )
+            results["unused_indexes"] = cur.fetchall()
+
+            # 2. Duplicate Indexes
+            _execute_safe(
+                cur,
+                """
+                select
+                  n.nspname as schema,
+                  t.relname as table,
+                  (select array_agg(a.attname) from pg_attribute a where a.attrelid = t.oid and a.attnum = any(idx.indkey)) as columns,
+                  array_agg(i.relname) as indexes,
+                  count(*) as dup_count
+                from pg_index idx
+                join pg_class t on t.oid = idx.indrelid
+                join pg_class i on i.oid = idx.indexrelid
+                join pg_namespace n on n.oid = t.relnamespace
+                where n.nspname not in ('pg_catalog', 'information_schema')
+                  and (%(schema)s::text is null or n.nspname = %(schema)s::text)
+                group by n.nspname, t.relname, t.oid, idx.indkey
+                having count(*) > 1
+                limit %(limit)s
+                """,
+                {"schema": schema, "limit": limit}
+            )
+            results["duplicate_indexes"] = cur.fetchall()
+            results["missing_indexes"] = []
+            results["redundant_indexes"] = []
+
+            return results
+
+
+@mcp.tool
+def list_largest_tables(schema: str = "public", limit: int = 30) -> list[dict[str, Any]]:
+    """
+    List the largest tables in a specific schema ranked by total size (including indexes and TOAST).
+    
+    Args:
+        schema: Schema name (default: 'public').
+        limit: Maximum number of tables to return (default: 30).
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            _execute_safe(
+                cur,
+                """
+                select
+                  n.nspname as schema,
+                  c.relname as table,
+                  pg_total_relation_size(c.oid) as total_size_bytes,
+                  pg_relation_size(c.oid) as table_size_bytes,
+                  pg_total_relation_size(c.oid) - pg_relation_size(c.oid) as index_size_bytes,
+                  reltuples::bigint as approx_rows
+                from pg_class c
+                join pg_namespace n on n.oid = c.relnamespace
+                where n.nspname = %(schema)s
+                  and c.relkind = 'r'
+                order by pg_total_relation_size(c.oid) desc
+                limit %(limit)s
+                """,
+                {"schema": schema, "limit": limit}
+            )
+            return cur.fetchall()
+
+
+@mcp.tool
+def list_temp_objects() -> dict[str, Any]:
+    """
+    List temporary schemas with object counts and total size.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            _execute_safe(
+                cur,
+                """
+                select
+                  n.nspname as schema,
+                  count(*) as object_count,
+                  pg_size_pretty(sum(pg_total_relation_size(c.oid))) as total_size
+                from pg_class c
+                join pg_namespace n on n.oid = c.relnamespace
+                where n.nspname like 'pg_temp%%'
+                group by n.nspname
+                order by sum(pg_total_relation_size(c.oid)) desc
+                """
+            )
+            rows = cur.fetchall()
+            return {
+                "temp_schemas": rows,
+                "total_temp_objects": sum(r["object_count"] for r in rows) if rows else 0
+            }
+
+
+@mcp.tool
+def table_sizes(schema: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    """
+    List tables by size including indexes and TOAST.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            _execute_safe(
+                cur,
+                """
+                select
+                  n.nspname as schema,
+                  c.relname as table,
+                  pg_size_pretty(pg_total_relation_size(c.oid)) as total_size,
+                  pg_size_pretty(pg_relation_size(c.oid)) as table_size,
+                  pg_size_pretty(pg_total_relation_size(c.oid) - pg_relation_size(c.oid)) as index_size,
+                  reltuples::bigint as approx_rows
+                from pg_class c
+                join pg_namespace n on n.oid = c.relnamespace
+                where c.relkind = 'r'
+                  and n.nspname not in ('pg_catalog', 'information_schema')
+                  and (%(schema)s::text is null or n.nspname = %(schema)s::text)
+                order by pg_total_relation_size(c.oid) desc
+                limit %(limit)s
+                """,
+                {"schema": schema, "limit": limit}
+            )
+            return cur.fetchall()
+
+
+@mcp.tool
+def index_usage(schema: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    """
+    Show index usage statistics.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            _execute_safe(
+                cur,
+                """
+                select
+                  schemaname as schema,
+                  relname as table,
+                  indexrelname as index,
+                  idx_scan as scans,
+                  idx_tup_read as tuples_read,
+                  idx_tup_fetch as tuples_fetched
+                from pg_stat_user_indexes
+                where (%(schema)s::text is null or schemaname = %(schema)s::text)
+                order by idx_scan desc
+                limit %(limit)s
+                """,
+                {"schema": schema, "limit": limit}
+            )
+            return cur.fetchall()
+
+
+@mcp.tool
+def maintenance_stats(schema: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    """
+    Show vacuum and analyze statistics.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            _execute_safe(
+                cur,
+                """
+                select
+                  schemaname as schema,
+                  relname as table,
+                  n_live_tup as live_rows,
+                  n_dead_tup as dead_rows,
+                  round((n_dead_tup::numeric / greatest(n_live_tup + n_dead_tup, 1)::numeric) * 100, 2) as dead_ratio,
+                  last_vacuum,
+                  last_autovacuum,
+                  last_analyze,
+                  last_autoanalyze,
+                  vacuum_count + autovacuum_count as total_vacuums,
+                  analyze_count + autoanalyze_count as total_analyzes
+                from pg_stat_user_tables
+                where (%(schema)s::text is null or schemaname = %(schema)s::text)
+                order by n_dead_tup desc
+                limit %(limit)s
+                """,
+                {"schema": schema, "limit": limit}
+            )
+            return cur.fetchall()
+
+
+@mcp.tool
 def describe_table(schema: str, table: str) -> dict[str, Any]:
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -1616,6 +2072,23 @@ def explain_query(
             return {"format": "text", "plan": text}
 
 
+@mcp.tool
+def ping() -> dict[str, Any]:
+    return {"ok": True}
+
+
+@mcp.tool
+def server_info_mcp() -> dict[str, Any]:
+    """Get information about the MCP server."""
+    return {
+        "name": mcp.name,
+        "version": "1.0.0",
+        "status": "healthy",
+        "transport": os.environ.get("MCP_TRANSPORT", "http"),
+        "database": os.environ.get("PGDATABASE", "unknown")
+    }
+
+
 def _configure_fastmcp_runtime() -> None:
     cert_file = os.environ.get("SSL_CERT_FILE")
     if cert_file and not os.path.exists(cert_file):
@@ -1638,14 +2111,27 @@ def main() -> None:
     stateless = _env_bool("MCP_STATELESS", False)
     json_resp = _env_bool("MCP_JSON_RESPONSE", False)
     
+    # SSL Configuration for HTTPS
+    ssl_cert = os.environ.get("MCP_SSL_CERT")
+    ssl_key = os.environ.get("MCP_SSL_KEY")
+    
     if transport in {"http", "sse"}:
-        mcp.run(
-            transport=transport,
-            host=host,
-            port=port,
-            stateless_http=stateless,
-            json_response=json_resp
-        )
+        run_kwargs = {
+            "transport": transport,
+            "host": host,
+            "port": port,
+            "stateless_http": stateless,
+            "json_response": json_resp
+        }
+        
+        if ssl_cert and ssl_key:
+            run_kwargs["ssl_certfile"] = ssl_cert
+            run_kwargs["ssl_keyfile"] = ssl_key
+            logger.info(f"Starting MCP server with HTTPS enabled using cert: {ssl_cert}")
+        
+        mcp.run(**run_kwargs)
+    elif transport == "stdio":
+        mcp.run(transport="stdio")
     else:
         mcp.run()
 

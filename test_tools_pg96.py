@@ -162,6 +162,12 @@ def _call_all_tools() -> None:
         "create_db_user",
         "drop_db_user",
         "kill_session",
+        "analyze_indexes",
+        "list_largest_tables",
+        "list_temp_objects",
+        "table_sizes",
+        "index_usage",
+        "maintenance_stats",
     ]
     missing = [name for name in required if not hasattr(server, name)]
     _assert(not missing, f"Missing expected tools: {missing}")
@@ -233,6 +239,25 @@ def _call_all_tools() -> None:
             pid = cur.fetchone()[0]
         killed = _invoke(server, "kill_session", {"pid": pid})
         _assert(isinstance(killed, dict) and killed.get("pid") == pid, "kill_session did not echo pid")
+
+        # Additional tools added recently
+        idx_stats = _invoke(server, "analyze_indexes", {"schema": "public"})
+        _assert(isinstance(idx_stats, dict) and "unused_indexes" in idx_stats, "analyze_indexes failed")
+
+        largest_tables = _invoke(server, "list_largest_tables", {"schema": "public", "limit": 5})
+        _assert(isinstance(largest_tables, list) and len(largest_tables) > 0, "list_largest_tables failed")
+
+        temp_objs = _invoke(server, "list_temp_objects")
+        _assert(isinstance(temp_objs, dict) and "temp_schemas" in temp_objs, "list_temp_objects failed")
+
+        t_sizes = _invoke(server, "table_sizes", {"schema": "public", "limit": 5})
+        _assert(isinstance(t_sizes, list) and len(t_sizes) > 0, "table_sizes failed")
+
+        i_usage = _invoke(server, "index_usage", {"schema": "public", "limit": 5})
+        _assert(isinstance(i_usage, list) and len(i_usage) > 0, "index_usage failed")
+
+        m_stats = _invoke(server, "maintenance_stats", {"schema": "public", "limit": 5})
+        _assert(isinstance(m_stats, list) and len(m_stats) > 0, "maintenance_stats failed")
     finally:
         try:
             victim.close()
