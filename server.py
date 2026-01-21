@@ -1,8 +1,10 @@
+import asyncio
 import json
 import hashlib
 import logging
 import os
 import re
+import sys
 from typing import Any
 
 from fastmcp import FastMCP
@@ -13,6 +15,23 @@ from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, JSONResponse
+
+# Patch for Windows asyncio ProactorEventLoop "ConnectionResetError" noise on shutdown
+if sys.platform == 'win32':
+    try:
+        from asyncio.proactor_events import _ProactorBasePipeTransport
+
+        _original_call_connection_lost = _ProactorBasePipeTransport._call_connection_lost
+
+        def _silenced_call_connection_lost(self, exc):
+            try:
+                _original_call_connection_lost(self, exc)
+            except ConnectionResetError:
+                pass  # Benign: connection forcibly closed by remote host during shutdown
+
+        _ProactorBasePipeTransport._call_connection_lost = _silenced_call_connection_lost
+    except ImportError:
+        pass
 
 # Configure structured logging
 log_level_str = os.environ.get("MCP_LOG_LEVEL", "INFO").upper()
