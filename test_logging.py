@@ -21,7 +21,7 @@ class TestRunQueryLogging(unittest.TestCase):
         self.root_logger.removeHandler(self.stream_handler)
 
     def test_run_query_logging(self) -> None:
-        tool_obj = server.run_query
+        tool_obj = server.db_pg96_run_query
         func = getattr(tool_obj, "fn", getattr(tool_obj, "func", None))
         self.assertIsNotNone(func, "Could not find underlying function on Tool object.")
 

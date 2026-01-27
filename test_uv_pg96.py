@@ -159,6 +159,7 @@ def _test_uv_stdio() -> None:
     env = {
         "DATABASE_URL": f"postgresql://{USER}:{PASSWORD}@{HOST}:{PORT}/{DB}",
         "MCP_ALLOW_WRITE": "true",
+        "MCP_CONFIRM_WRITE": "true",
         "MCP_TRANSPORT": "stdio"
     }
     
@@ -177,20 +178,20 @@ def _test_uv_stdio() -> None:
         client.send_notification("notifications/initialized")
         
         tools_to_test = [
-            ("ping", {}),
-            ("server_info", {}),
-            ("list_databases", {}),
-            ("list_schemas", {"include_system": False}),
-            ("list_tables", {"schema": "public"}),
-            ("describe_table", {"schema": "public", "table": "customers"}),
-            ("run_query", {"sql": "select count(*) from public.orders"}),
-            ("explain_query", {"sql": "select * from public.orders", "format": "text"}),
-            ("db_stats", {"database": DB}),
-            ("check_bloat", {"limit": 5}),
-            ("list_largest_schemas", {"limit": 5}),
-            ("analyze_sessions", {}),
-            ("analyze_table_health", {"limit": 5}),
-            ("database_security_performance_metrics", {}),
+            ("db_pg96_ping", {}),
+            ("db_pg96_server_info", {}),
+            ("db_pg96_list_databases", {}),
+            ("db_pg96_list_schemas", {"include_system": False}),
+            ("db_pg96_list_tables", {"schema": "public"}),
+            ("db_pg96_describe_table", {"schema": "public", "table": "customers"}),
+            ("db_pg96_run_query", {"sql": "select count(*) from public.orders"}),
+            ("db_pg96_explain_query", {"sql": "select * from public.orders", "format": "text"}),
+            ("db_pg96_db_stats", {"database": DB}),
+            ("db_pg96_check_bloat", {"limit": 5}),
+            ("db_pg96_list_largest_schemas", {"limit": 5}),
+            ("db_pg96_analyze_sessions", {}),
+            ("db_pg96_analyze_table_health", {"limit": 5}),
+            ("db_pg96_database_security_performance_metrics", {}),
         ]
         
         for name, params in tools_to_test:
@@ -204,14 +205,14 @@ def _test_uv_stdio() -> None:
             print(f"  Tool {name} OK")
 
         username = f"test_uv_user_{int(time.time())}"
-        print(f"Testing create_db_user: {username}...")
+        print(f"Testing db_pg96_create_db_user: {username}...")
         client.send_request("tools/call", {
-            "name": "create_db_user",
+            "name": "db_pg96_create_db_user",
             "arguments": {"username": username, "password": "password123", "privileges": "read", "database": DB}
         })
-        print(f"Testing drop_db_user: {username}...")
+        print(f"Testing db_pg96_drop_db_user: {username}...")
         client.send_request("tools/call", {
-            "name": "drop_db_user",
+            "name": "db_pg96_drop_db_user",
             "arguments": {"username": username}
         })
         

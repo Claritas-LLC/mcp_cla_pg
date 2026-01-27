@@ -174,26 +174,26 @@ def _test_docker_http() -> None:
     call_tool("notifications/initialized", {}, is_notification=True)
 
     tools_to_test = [
-        ("ping", {}),
-        ("server_info", {}),
-        ("list_databases", {}),
-        ("list_schemas", {"include_system": False}),
-        ("list_tables", {"schema": "public"}),
-        ("describe_table", {"schema": "public", "table": "customers"}),
-        ("run_query", {"sql": "select count(*) from public.orders"}),
-        ("explain_query", {"sql": "select * from public.orders", "format": "text"}),
-        ("db_stats", {"database": DB_NAME}),
-        ("check_bloat", {"limit": 5}),
-        ("list_largest_schemas", {"limit": 5}),
-        ("analyze_sessions", {}),
-        ("analyze_table_health", {"limit": 5}),
-        ("database_security_performance_metrics", {}),
-        ("analyze_indexes", {"schema": "public"}),
-        ("list_largest_tables", {"schema": "public", "limit": 5}),
-        ("list_temp_objects", {}),
-        ("table_sizes", {"schema": "public", "limit": 5}),
-        ("index_usage", {"schema": "public", "limit": 5}),
-        ("maintenance_stats", {"schema": "public", "limit": 5}),
+        ("db_pg96_ping", {}),
+        ("db_pg96_server_info", {}),
+        ("db_pg96_list_databases", {}),
+        ("db_pg96_list_schemas", {"include_system": False}),
+        ("db_pg96_list_tables", {"schema": "public"}),
+        ("db_pg96_describe_table", {"schema": "public", "table": "customers"}),
+        ("db_pg96_run_query", {"sql": "select count(*) from public.orders"}),
+        ("db_pg96_explain_query", {"sql": "select * from public.orders", "output_format": "text"}),
+        ("db_pg96_db_stats", {"database": DB_NAME}),
+        ("db_pg96_check_bloat", {"limit": 5}),
+        ("db_pg96_list_largest_schemas", {"limit": 5}),
+        ("db_pg96_analyze_sessions", {}),
+        ("db_pg96_analyze_table_health", {"limit": 5}),
+        ("db_pg96_database_security_performance_metrics", {}),
+        ("db_pg96_analyze_indexes", {"schema": "public"}),
+        ("db_pg96_list_largest_tables", {"schema": "public", "limit": 5}),
+        ("db_pg96_list_temp_objects", {}),
+        ("db_pg96_table_sizes", {"schema": "public", "limit": 5}),
+        ("db_pg96_index_usage", {"schema": "public", "limit": 5}),
+        ("db_pg96_maintenance_stats", {"schema": "public", "limit": 5}),
     ]
 
     for name, params in tools_to_test:
@@ -203,19 +203,23 @@ def _test_docker_http() -> None:
 
     # Test write operations
     username = f"test_docker_user_{int(time.time())}"
-    print(f"Testing create_db_user: {username}...")
-    call_tool("tools/call", {"name": "create_db_user", "arguments": {"username": username, "password": "password123", "privileges": "read", "database": DB_NAME}})
-    print(f"Testing drop_db_user: {username}...")
-    call_tool("tools/call", {"name": "drop_db_user", "arguments": {"username": username}})
+    print(f"Testing db_pg96_create_db_user: {username}...")
+    call_tool("tools/call", {"name": "db_pg96_create_db_user", "arguments": {"username": username, "password": "password123", "privileges": "read", "database": DB_NAME}})
+    print(f"Testing db_pg96_drop_db_user: {username}...")
+    call_tool("tools/call", {"name": "db_pg96_drop_db_user", "arguments": {"username": username}})
 
     print("PASS: All tools tested successfully via Docker Stateless HTTP transport.")
 
 def main() -> int:
     try:
         print("Starting stack via Docker Compose...")
+        # Run the container in HTTP mode with write enabled
+        # We explicitly set auth to "none" to pass the new security check for testing
         os.environ["DATABASE_URL"] = f"postgresql://{USER}:{PASSWORD}@{DB_SERVICE}:5432/{DB_NAME}"
         os.environ["MCP_ALLOW_WRITE"] = "true"
+        os.environ["MCP_CONFIRM_WRITE"] = "true"
         os.environ["MCP_TRANSPORT"] = "http"
+        os.environ["FASTMCP_AUTH_TYPE"] = "none"
         os.environ["MCP_STATELESS"] = "true"
         os.environ["MCP_JSON_RESPONSE"] = "true"
         

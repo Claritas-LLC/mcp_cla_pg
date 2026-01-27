@@ -5,6 +5,8 @@ import logging
 import os
 import re
 import sys
+from datetime import timedelta
+from urllib.parse import quote
 from typing import Any
 
 from fastmcp import FastMCP
@@ -15,23 +17,6 @@ from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, JSONResponse
-
-# Patch for Windows asyncio ProactorEventLoop "ConnectionResetError" noise on shutdown
-if sys.platform == 'win32':
-    try:
-        from asyncio.proactor_events import _ProactorBasePipeTransport
-
-        _original_call_connection_lost = _ProactorBasePipeTransport._call_connection_lost
-
-        def _silenced_call_connection_lost(self, exc):
-            try:
-                _original_call_connection_lost(self, exc)
-            except ConnectionResetError:
-                pass  # Benign: connection forcibly closed by remote host during shutdown
-
-        _ProactorBasePipeTransport._call_connection_lost = _silenced_call_connection_lost
-    except ImportError:
-        pass
 
 # Configure structured logging
 log_level_str = os.environ.get("MCP_LOG_LEVEL", "INFO").upper()
@@ -45,6 +30,35 @@ logging.basicConfig(
     filemode='a' if log_file else None
 )
 logger = logging.getLogger("mcp-postgres")
+
+# Patch for Windows asyncio ProactorEventLoop "ConnectionResetError" noise on shutdown
+# References:
+# - https://bugs.python.org/issue39232 (bpo-39232)
+# - https://github.com/python/cpython/issues/83413
+# Rationale:
+# On Windows, when the ProactorEventLoop is closing, if a connection is forcibly closed
+# by the remote (or the process is terminating), _call_connection_lost can raise
+# ConnectionResetError (WinError 10054). This is harmless but noisy in logs.
+if sys.platform == 'win32':
+    # This issue primarily affects Python 3.8+, where Proactor is the default.
+    if sys.version_info >= (3, 8):
+        try:
+            from asyncio.proactor_events import _ProactorBasePipeTransport
+
+            _original_call_connection_lost = _ProactorBasePipeTransport._call_connection_lost
+
+            def _silenced_call_connection_lost(self, exc):
+                try:
+                    _original_call_connection_lost(self, exc)
+                except ConnectionResetError:
+                    pass  # Benign: connection forcibly closed by remote host during shutdown
+
+            _ProactorBasePipeTransport._call_connection_lost = _silenced_call_connection_lost
+            logger.debug("Applied workaround for asyncio ProactorEventLoop ConnectionResetError")
+        except ImportError:
+            logger.info("Could not import asyncio.proactor_events._ProactorBasePipeTransport; skipping workaround")
+    else:
+        logger.debug("Skipping asyncio ProactorEventLoop workaround (Python version < 3.8)")
 
 def _get_auth() -> Any:
     auth_type = os.environ.get("FASTMCP_AUTH_TYPE")
@@ -168,8 +182,12 @@ def _build_database_url_from_pg_env() -> str | None:
     database = os.environ.get("PGDATABASE")
     if not host or not user or not database:
         return None
-    password_part = f":{password}" if password else ""
-    return f"postgresql://{user}{password_part}@{host}:{port}/{database}"
+    
+    # URL-encode user and password to handle special characters
+    user_encoded = quote(user)
+    password_part = f":{quote(password)}" if password else ""
+    
+    return f"postgresql://{user_encoded}{password_part}@{host}:{port}/{database}"
 
 
 DATABASE_URL = os.environ.get("DATABASE_URL") or _build_database_url_from_pg_env()
@@ -182,6 +200,28 @@ if os.environ.get("MCP_ALLOW_WRITE") is None:
     raise RuntimeError("MCP_ALLOW_WRITE environment variable is required (e.g. 'true' or 'false')")
 
 ALLOW_WRITE = _env_bool("MCP_ALLOW_WRITE", False)
+CONFIRM_WRITE = _env_bool("MCP_CONFIRM_WRITE", False)
+TRANSPORT = os.environ.get("MCP_TRANSPORT", "http").lower()
+AUTH_TYPE = os.environ.get("FASTMCP_AUTH_TYPE")
+
+# Security Mechanisms for Write Mode
+if ALLOW_WRITE:
+    # Mechanism 1: Explicit Confirmation Latch (Prevents accidental enablement)
+    if not CONFIRM_WRITE:
+        raise RuntimeError(
+            "Security Check Failed: Write mode enabled (MCP_ALLOW_WRITE=true) "
+            "but missing confirmation. You must also set MCP_CONFIRM_WRITE=true."
+        )
+
+    # Mechanism 2: Transport Security / Auth Enforcement (Prevents insecure exposure)
+    # If running over HTTP, we MUST have some form of authentication configured.
+    if TRANSPORT == "http" and not AUTH_TYPE:
+        raise RuntimeError(
+            "Security Check Failed: Write mode enabled over HTTP without authentication. "
+            "You must configure FASTMCP_AUTH_TYPE (e.g., 'azure-ad', 'oidc', 'jwt') "
+            "or use stdio transport for local access."
+        )
+
 DEFAULT_MAX_ROWS = _env_int("MCP_MAX_ROWS", 500)
 POOL_MIN_SIZE = _env_int("MCP_POOL_MIN_SIZE", 1)
 POOL_MAX_SIZE = _env_int("MCP_POOL_MAX_SIZE", 5)
@@ -322,17 +362,17 @@ async def root(_request: Request) -> JSONResponse:
         "endpoints": {
             "mcp": "/mcp (MCP/SSE protocol endpoint)",
             "health": "/health",
-            "info": "use 'server_info' tool via MCP"
+            "info": "use 'db_pg96_server_info' tool via MCP"
         }
     })
 
 
 @mcp.tool
-def create_db_user(
+def db_pg96_create_db_user(
     username: str,
     password: str,
     privileges: str = "read",
-    database: str = "lenexa"
+    database: str | None = None
 ) -> str:
     """
     Creates a new database user and assigns privileges.
@@ -341,7 +381,7 @@ def create_db_user(
         username: The name of the user to create.
         password: The password for the new user.
         privileges: 'read' for SELECT only, 'read-write' for full DML access.
-        database: The database to grant access to (default: 'lenexa').
+        database: The database to grant access to (default: current database).
     """
     if not ALLOW_WRITE:
         raise ValueError("Write operations are disabled. Set MCP_ALLOW_WRITE=true to enable user creation.")
@@ -359,6 +399,13 @@ def create_db_user(
     # and warn if the grants might be schema-specific to the current DB.
     with pool.connection() as conn:
         with conn.cursor() as cur:
+            # Resolve database if not provided
+            cur.execute("SELECT current_database()")
+            current_db = cur.fetchone()['current_database']
+            
+            target_db = database if database is not None else current_db
+            is_same_db = target_db == current_db
+
             # 1. Create the user (Global operation)
             logger.info(f"Creating database user: {username}")
             _execute_safe(
@@ -373,68 +420,78 @@ def create_db_user(
             _execute_safe(
                 cur,
                 sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
-                    sql.Identifier(database),
+                    sql.Identifier(target_db),
                     sql.Identifier(username),
                 ),
             )
 
-            # 3. Grant schema/table permissions
-            # Note: These typically apply to the database the session is currently connected to.
-            if privileges == "read":
-                _execute_safe(
-                    cur,
-                    sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(username)),
-                )
-                _execute_safe(
-                    cur,
-                    sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(sql.Identifier(username)),
-                )
-                # Optionally grant ro_role if it exists
-                cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'ro_role'")
-                if cur.fetchone():
+            # 3. Grant schema/table permissions (Only if connected to the target DB)
+            if is_same_db:
+                # Note: These typically apply to the database the session is currently connected to.
+                if privileges == "read":
                     _execute_safe(
                         cur,
-                        sql.SQL("GRANT ro_role to {}").format(sql.Identifier(username)),
+                        sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(username)),
                     )
-                _execute_safe(
-                    cur,
-                    sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {}").format(
-                        sql.Identifier(username)
-                    ),
-                )
+                    _execute_safe(
+                        cur,
+                        sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(sql.Identifier(username)),
+                    )
+                    # Optionally grant ro_role if it exists
+                    cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'ro_role'")
+                    if cur.fetchone():
+                        _execute_safe(
+                            cur,
+                            sql.SQL("GRANT ro_role to {}").format(sql.Identifier(username)),
+                        )
+                    _execute_safe(
+                        cur,
+                        sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {}").format(
+                            sql.Identifier(username)
+                        ),
+                    )
+                else:
+                    _execute_safe(
+                        cur,
+                        sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {} TO {}").format(
+                            sql.Identifier(target_db),
+                            sql.Identifier(username),
+                        ),
+                    )
+                    _execute_safe(
+                        cur,
+                        sql.SQL("GRANT ALL PRIVILEGES ON SCHEMA public TO {}").format(sql.Identifier(username)),
+                    )
+                    _execute_safe(
+                        cur,
+                        sql.SQL("GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO {}").format(sql.Identifier(username)),
+                    )
+                    _execute_safe(
+                        cur,
+                        sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {}").format(
+                            sql.Identifier(username)
+                        ),
+                    )
+                
+                return f"User '{username}' created successfully with {privileges} privileges on database '{target_db}'."
             else:
-                _execute_safe(
-                    cur,
-                    sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {} TO {}").format(
-                        sql.Identifier(database),
-                        sql.Identifier(username),
-                    ),
+                return (
+                    f"User '{username}' created and granted CONNECT on database '{target_db}'. "
+                    f"WARNING: Schema/Table privileges were NOT applied because the server is connected to '{current_db}'. "
+                    f"To apply table privileges, please connect to '{target_db}'."
                 )
-                _execute_safe(
-                    cur,
-                    sql.SQL("GRANT ALL PRIVILEGES ON SCHEMA public TO {}").format(sql.Identifier(username)),
-                )
-                _execute_safe(
-                    cur,
-                    sql.SQL("GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO {}").format(sql.Identifier(username)),
-                )
-                _execute_safe(
-                    cur,
-                    sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {}").format(
-                        sql.Identifier(username)
-                    ),
-                )
-
-            return f"User '{username}' created successfully with {privileges} privileges. Access granted to database '{database}'."
 
 
 @mcp.tool
-def drop_db_user(username: str) -> str:
+def db_pg96_drop_db_user(username: str) -> str:
     """
     Drops a database user (role).
 
     Args:
         username: The name of the user to drop.
+
+    Returns:
+        A message indicating success.
     """
     if not ALLOW_WRITE:
         raise ValueError("Write operations are disabled. Set MCP_ALLOW_WRITE=true to enable user deletion.")
@@ -458,12 +515,15 @@ def drop_db_user(username: str) -> str:
 
 
 @mcp.tool
-def check_bloat(limit: int = 50) -> list[dict[str, Any]]:
+def db_pg96_check_bloat(limit: int = 50) -> list[dict[str, Any]]:
     """
     Identifies the top bloated tables and indexes and provides maintenance commands.
 
     Args:
         limit: Maximum number of objects to return (default: 50).
+
+    Returns:
+        List of objects with bloat statistics and suggested maintenance commands.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -568,7 +628,7 @@ def check_bloat(limit: int = 50) -> list[dict[str, Any]]:
 
 
 @mcp.tool
-def db_stats(database: str | None = None, include_performance: bool = False) -> list[dict[str, Any]] | dict[str, Any]:
+def db_pg96_db_stats(database: str | None = None, include_performance: bool = False) -> list[dict[str, Any]] | dict[str, Any]:
     """
     Get database-level statistics including commits, rollbacks, temp files, and deadlocks.
     
@@ -670,7 +730,7 @@ def db_stats(database: str | None = None, include_performance: bool = False) -> 
 
 
 @mcp.tool
-def analyze_table_health(
+def db_pg96_analyze_table_health(
     schema: str | None = None,
     min_size_mb: int = 50,
     include_bloat: bool = True,
@@ -744,7 +804,7 @@ def analyze_table_health(
             candidate_oids = [row['oid'] for row in cur.fetchall()]
             
             candidate_tables = []
-            for oid in candidate_oids:
+            if candidate_oids:
                 _execute_safe(
                     cur,
                     """
@@ -776,11 +836,11 @@ def analyze_table_health(
                     from pg_class c
                     join pg_namespace n on n.oid = c.relnamespace
                     left join pg_stat_user_tables s on s.relid = c.oid
-                    where c.oid = %(oid)s
+                    where c.oid = any(%(oids)s)
                     """,
-                    {"oid": oid}
+                    {"oids": candidate_oids}
                 )
-                candidate_tables.append(cur.fetchone())
+                candidate_tables = cur.fetchall()
             
             results["summary"]["total_tables_analyzed"] = len(candidate_tables)
 
@@ -946,7 +1006,7 @@ def analyze_table_health(
 
 
 @mcp.tool
-def database_security_performance_metrics(
+def db_pg96_database_security_performance_metrics(
     cache_hit_threshold: int | None = None,
     connection_usage_threshold: float | None = None,
     profile: str = "oltp"
@@ -1227,7 +1287,7 @@ def database_security_performance_metrics(
 
 
 @mcp.tool
-def recommend_partitioning(
+def db_pg96_recommend_partitioning(
     min_size_gb: float = 1.0,
     schema: str | None = None,
     limit: int = 50
@@ -1383,7 +1443,7 @@ def recommend_partitioning(
 
 
 @mcp.tool
-def analyze_sessions(
+def db_pg96_analyze_sessions(
     include_idle: bool = True,
     include_active: bool = True,
     include_locked: bool = True,
@@ -1532,7 +1592,7 @@ def analyze_sessions(
 
             # Generate recommendations based on findings
             if results["active_sessions"]:
-                longest_active = max(results["active_sessions"], key=lambda x: x["query_age"] or x["xact_age"])
+                longest_active = max(results["active_sessions"], key=lambda x: (x["query_age"] or x["xact_age"] or timedelta(0)))
                 results["recommendations"].append(
                     f"Longest active session: PID {longest_active['pid']} ({longest_active['user']}) running for {longest_active['query_age']}"
                 )
@@ -1552,13 +1612,16 @@ def analyze_sessions(
 
 
 @mcp.tool
-def kill_session(pid: int) -> dict[str, Any]:
+def db_pg96_kill_session(pid: int) -> dict[str, Any]:
     """
     Terminates a database session by its process ID (PID).
     Requires MCP_ALLOW_WRITE=true.
 
     Args:
         pid: The process ID of the session to terminate.
+
+    Returns:
+        Dictionary indicating success or failure of the termination attempt.
     """
     if not ALLOW_WRITE:
         raise ValueError("Write operations are disabled. Set MCP_ALLOW_WRITE=true to enable killing sessions.")
@@ -1583,7 +1646,10 @@ def kill_session(pid: int) -> dict[str, Any]:
 
 
 @mcp.tool
-def server_info() -> dict[str, Any]:
+def db_pg96_server_info() -> dict[str, Any]:
+    """
+    Retrieves information about the current PostgreSQL server connection and version.
+    """
     with pool.connection() as conn:
         with conn.cursor() as cur:
             _execute_safe(
@@ -1598,7 +1664,9 @@ def server_info() -> dict[str, Any]:
                 """
             )
             row = cur.fetchone()
-            assert row is not None
+            if row is None:
+                raise RuntimeError("Failed to retrieve server info: database query returned no rows")
+                
             return {
                 "database": row["database"],
                 "user": row["user"],
@@ -1612,12 +1680,15 @@ def server_info() -> dict[str, Any]:
 
 
 @mcp.tool
-def get_db_parameters(pattern: str | None = None) -> list[dict[str, Any]]:
+def db_pg96_get_db_parameters(pattern: str | None = None) -> list[dict[str, Any]]:
     """
     Retrieves database configuration parameters (GUCs).
 
     Args:
         pattern: Optional regex pattern to filter parameter names (e.g., 'max_connections' or 'shared_.*').
+
+    Returns:
+        List of database parameters with their settings, units, and descriptions.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -1671,10 +1742,17 @@ def get_db_parameters(pattern: str | None = None) -> list[dict[str, Any]]:
 
 
 @mcp.tool
-def list_databases() -> list[dict[str, Any]]:
+def db_pg96_list_databases() -> list[dict[str, Any]]:
+    """
+    Lists all databases in the PostgreSQL cluster with their sizes and connection status.
+
+    Returns:
+        List of databases with name, size in bytes, connection allowance, and template status.
+    """
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
+            _execute_safe(
+                cur,
                 """
                 select
                   datname as name,
@@ -1689,11 +1767,21 @@ def list_databases() -> list[dict[str, Any]]:
 
 
 @mcp.tool
-def list_schemas(include_system: bool = False) -> list[str]:
+def db_pg96_list_schemas(include_system: bool = False) -> list[str]:
+    """
+    Lists schemas in the current database.
+    
+    Args:
+        include_system: If True, includes system schemas like pg_catalog and information_schema.
+
+    Returns:
+        List of schema names.
+    """
     with pool.connection() as conn:
         with conn.cursor() as cur:
             if include_system:
-                cur.execute(
+                _execute_safe(
+                    cur,
                     """
                     select nspname
                     from pg_namespace
@@ -1701,7 +1789,8 @@ def list_schemas(include_system: bool = False) -> list[str]:
                     """
                 )
             else:
-                cur.execute(
+                _execute_safe(
+                    cur,
                     """
                     select nspname
                     from pg_namespace
@@ -1714,12 +1803,15 @@ def list_schemas(include_system: bool = False) -> list[str]:
 
 
 @mcp.tool
-def list_largest_schemas(limit: int = 30) -> list[dict[str, Any]]:
+def db_pg96_list_largest_schemas(limit: int = 30) -> list[dict[str, Any]]:
     """
     Lists the largest schemas in the current database ordered by total size.
 
     Args:
         limit: Maximum number of schemas to return (default: 30).
+
+    Returns:
+        List of schemas with their name and total size in bytes.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -1744,10 +1836,20 @@ def list_largest_schemas(limit: int = 30) -> list[dict[str, Any]]:
 
 
 @mcp.tool
-def list_tables(schema: str = "public") -> list[dict[str, Any]]:
+def db_pg96_list_tables(schema: str = "public") -> list[dict[str, Any]]:
+    """
+    Lists tables and their types in a specific schema.
+    
+    Args:
+        schema: The schema to list tables from (default: 'public').
+
+    Returns:
+        List of tables with schema, name, and type.
+    """
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
+            _execute_safe(
+                cur,
                 """
                 select
                   table_schema,
@@ -1763,13 +1865,16 @@ def list_tables(schema: str = "public") -> list[dict[str, Any]]:
 
 
 @mcp.tool
-def analyze_indexes(schema: str | None = None, limit: int = 50) -> dict[str, Any]:
+def db_pg96_analyze_indexes(schema: str | None = None, limit: int = 50) -> dict[str, Any]:
     """
     Identify unused and duplicate indexes.
     
     Args:
         schema: Optional schema name to filter.
         limit: Maximum number of rows to return for each category.
+
+    Returns:
+        Dictionary containing lists of unused, duplicate, missing, and redundant indexes.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -1833,7 +1938,7 @@ def analyze_indexes(schema: str | None = None, limit: int = 50) -> dict[str, Any
 
 
 @mcp.tool
-def list_largest_tables(schema: str = "public", limit: int = 30) -> list[dict[str, Any]]:
+def db_pg96_list_largest_tables(schema: str = "public", limit: int = 30) -> list[dict[str, Any]]:
     """
     List the largest tables in a specific schema ranked by total size (including indexes and TOAST).
     
@@ -1866,9 +1971,12 @@ def list_largest_tables(schema: str = "public", limit: int = 30) -> list[dict[st
 
 
 @mcp.tool
-def list_temp_objects() -> dict[str, Any]:
+def db_pg96_list_temp_objects() -> dict[str, Any]:
     """
     List temporary schemas with object counts and total size.
+
+    Returns:
+        Dictionary containing a list of temporary schemas and the total count of temporary objects.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -1894,9 +2002,16 @@ def list_temp_objects() -> dict[str, Any]:
 
 
 @mcp.tool
-def table_sizes(schema: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+def db_pg96_table_sizes(schema: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
     """
     List tables by size including indexes and TOAST.
+
+    Args:
+        schema: Optional schema name to filter. If None, lists tables from all user schemas.
+        limit: Maximum number of tables to return (default: 20).
+
+    Returns:
+        List of tables with their total size, table size, index size, and approximate row count.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -1924,9 +2039,16 @@ def table_sizes(schema: str | None = None, limit: int = 20) -> list[dict[str, An
 
 
 @mcp.tool
-def index_usage(schema: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+def db_pg96_index_usage(schema: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
     """
-    Show index usage statistics.
+    Show index usage statistics to identify frequently used or unused indexes.
+
+    Args:
+        schema: Optional schema name to filter. If None, lists indexes from all user schemas.
+        limit: Maximum number of indexes to return (default: 20).
+
+    Returns:
+        List of indexes with scan counts and tuple read/fetch statistics.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -1951,9 +2073,16 @@ def index_usage(schema: str | None = None, limit: int = 20) -> list[dict[str, An
 
 
 @mcp.tool
-def maintenance_stats(schema: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+def db_pg96_maintenance_stats(schema: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
     """
-    Show vacuum and analyze statistics.
+    Show vacuum and analyze statistics to monitor autovacuum activity and dead tuple accumulation.
+
+    Args:
+        schema: Optional schema name to filter. If None, lists tables from all user schemas.
+        limit: Maximum number of tables to return (default: 50).
+
+    Returns:
+        List of tables with dead tuple counts, last vacuum/analyze times, and total vacuum/analyze counts.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -1983,7 +2112,17 @@ def maintenance_stats(schema: str | None = None, limit: int = 50) -> list[dict[s
 
 
 @mcp.tool
-def describe_table(schema: str, table: str) -> dict[str, Any]:
+def db_pg96_describe_table(schema: str, table: str) -> dict[str, Any]:
+    """
+    Get detailed information about a table's structure, including columns, indexes, and size.
+
+    Args:
+        schema: The schema the table belongs to.
+        table: The name of the table to describe.
+
+    Returns:
+        Dictionary containing schema, table name, columns, indexes, sizes, and approximate row count.
+    """
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -2050,7 +2189,23 @@ def describe_table(schema: str, table: str) -> dict[str, Any]:
 
 
 @mcp.tool
-def run_query(sql: str, params_json: str | None = None, max_rows: int | None = None) -> dict[str, Any]:
+def db_pg96_run_query(sql: str, params_json: str | None = None, max_rows: int | None = None) -> dict[str, Any]:
+    """
+    Execute a read-only SQL query against the database.
+
+    Note:
+        This tool attempts to enforce read-only execution by analyzing the SQL string.
+        Complex queries or obfuscation might bypass this check. 
+        Always operate with a user that has restricted permissions at the database level.
+
+    Args:
+        sql: The SQL query to execute.
+        params_json: Optional JSON string of parameters to bind to the query.
+        max_rows: Maximum number of rows to return (default: 500).
+
+    Returns:
+        Dictionary containing columns, rows, and truncation status.
+    """
     _require_readonly(sql)
     limit = max_rows if max_rows is not None else DEFAULT_MAX_ROWS
     if limit < 0:
@@ -2091,23 +2246,37 @@ def run_query(sql: str, params_json: str | None = None, max_rows: int | None = N
 
 
 @mcp.tool
-def explain_query(
+def db_pg96_explain_query(
     sql: str,
     analyze: bool = False,
     buffers: bool = False,
     verbose: bool = False,
     settings: bool = False,
-    format: str = "json",
+    output_format: str = "json",
 ) -> dict[str, Any]:
+    """
+    Get the execution plan for a query.
+
+    Args:
+        sql: The SQL query to explain.
+        analyze: If True, executes the query to get actual runtimes (default: False).
+        buffers: If True, includes buffer usage (requires analyze=True).
+        verbose: If True, includes detailed information.
+        settings: If True, includes configuration options.
+        output_format: Output format, either 'json' or 'text' (default: 'json').
+
+    Returns:
+        Dictionary containing the plan format and the plan content (json or text).
+    """
     sql_fingerprint = hashlib.sha256(sql.encode("utf-8")).hexdigest()
     logger.info(
-        f"explain_query called. format={format.strip().lower()} analyze={analyze} buffers={buffers} "
+        f"explain_query called. output_format={output_format.strip().lower()} analyze={analyze} buffers={buffers} "
         f"verbose={verbose} settings={settings} sql_len={len(sql)} sql_sha256={sql_fingerprint}"
     )
     _require_readonly(sql)
-    fmt = format.strip().lower()
+    fmt = output_format.strip().lower()
     if fmt not in {"json", "text"}:
-        raise ValueError("format must be 'json' or 'text'")
+        raise ValueError("output_format must be 'json' or 'text'")
 
     opts: list[str] = []
     if analyze:
@@ -2133,13 +2302,24 @@ def explain_query(
 
 
 @mcp.tool
-def ping() -> dict[str, Any]:
+def db_pg96_ping() -> dict[str, Any]:
+    """
+    Check if the MCP server is responsive.
+
+    Returns:
+        Dictionary with "ok": True if the server is responsive.
+    """
     return {"ok": True}
 
 
 @mcp.tool
-def server_info_mcp() -> dict[str, Any]:
-    """Get information about the MCP server."""
+def db_pg96_server_info_mcp() -> dict[str, Any]:
+    """
+    Get information about the MCP server configuration and status.
+
+    Returns:
+        Dictionary containing server name, version, status, transport type, and connected database name.
+    """
     with pool.connection() as conn:
         with conn.cursor() as cur:
             _execute_safe(
@@ -2203,7 +2383,7 @@ def main() -> None:
     elif transport == "stdio":
         mcp.run(transport="stdio")
     else:
-        mcp.run()
+        raise ValueError(f"Unknown transport: {transport}. Supported transports: http, sse, stdio")
 
 
 if __name__ == "__main__":

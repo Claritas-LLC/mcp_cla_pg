@@ -1,11 +1,13 @@
 services:
   mcp-postgres:
-    build: .
+    image: harryvaldez/mcp-postgres:latest
+    # build: .
     ports:
       - "8000:8000"
     environment:
       - DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/postgres}
       - MCP_ALLOW_WRITE=${MCP_ALLOW_WRITE:-false}
+      - MCP_CONFIRM_WRITE=${MCP_CONFIRM_WRITE:-false}
       - MCP_TRANSPORT=${MCP_TRANSPORT:-http}
       - MCP_STATELESS=${MCP_STATELESS:-false}
       - MCP_JSON_RESPONSE=${MCP_JSON_RESPONSE:-false}

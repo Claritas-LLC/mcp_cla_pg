@@ -137,6 +137,7 @@ def _invoke(server_module: Any, tool_name: str, kwargs: dict[str, Any] | None = 
 def _call_all_tools() -> None:
     os.environ["DATABASE_URL"] = f"postgresql://{USER}:{PASSWORD}@{HOST}:{PORT}/{DB}"
     os.environ["MCP_ALLOW_WRITE"] = "true"
+    os.environ["MCP_CONFIRM_WRITE"] = "true"
     os.environ["MCP_TRANSPORT"] = "stdio"
 
     if "server" in sys.modules:
@@ -145,91 +146,103 @@ def _call_all_tools() -> None:
     import server  # noqa: E402
 
     required = [
-        "ping",
-        "server_info",
-        "run_query",
-        "explain_query",
-        "list_databases",
-        "list_schemas",
-        "list_tables",
-        "describe_table",
-        "db_stats",
-        "check_bloat",
-        "get_db_parameters",
-        "analyze_sessions",
-        "analyze_table_health",
-        "database_security_performance_metrics",
-        "create_db_user",
-        "drop_db_user",
-        "kill_session",
-        "analyze_indexes",
-        "list_largest_tables",
-        "list_temp_objects",
-        "table_sizes",
-        "index_usage",
-        "maintenance_stats",
+        "db_pg96_ping",
+        "db_pg96_server_info",
+        "db_pg96_run_query",
+        "db_pg96_explain_query",
+        "db_pg96_list_databases",
+        "db_pg96_list_schemas",
+        "db_pg96_list_tables",
+        "db_pg96_describe_table",
+        "db_pg96_db_stats",
+        "db_pg96_check_bloat",
+        "db_pg96_get_db_parameters",
+        "db_pg96_analyze_sessions",
+        "db_pg96_analyze_table_health",
+        "db_pg96_database_security_performance_metrics",
+        "db_pg96_create_db_user",
+        "db_pg96_drop_db_user",
+        "db_pg96_kill_session",
+        "db_pg96_analyze_indexes",
+        "db_pg96_list_largest_tables",
+        "db_pg96_list_temp_objects",
+        "db_pg96_table_sizes",
+        "db_pg96_index_usage",
+        "db_pg96_maintenance_stats",
     ]
     missing = [name for name in required if not hasattr(server, name)]
     _assert(not missing, f"Missing expected tools: {missing}")
 
-    result = _invoke(server, "ping")
+    result = _invoke(server, "db_pg96_ping")
     _assert(isinstance(result, dict) and result.get("ok") is True, "ping did not return ok=true")
 
-    info = _invoke(server, "server_info")
+    info = _invoke(server, "db_pg96_server_info")
     _assert(isinstance(info, dict) and "version" in info, "server_info missing version")
 
-    params = _invoke(server, "get_db_parameters", {"pattern": "max_connections|shared_buffers"})
+    params = _invoke(server, "db_pg96_get_db_parameters", {"pattern": "max_connections|shared_buffers"})
     _assert(isinstance(params, list) and len(params) >= 1, "get_db_parameters returned no rows")
 
-    dbs = _invoke(server, "list_databases")
+    dbs = _invoke(server, "db_pg96_list_databases")
     _assert(isinstance(dbs, list) and any(r.get("name") == DB for r in dbs), "list_databases did not include test database")
 
-    schemas = _invoke(server, "list_schemas", {"include_system": False})
+    schemas = _invoke(server, "db_pg96_list_schemas", {"include_system": False})
     _assert(isinstance(schemas, list) and "public" in schemas, "list_schemas did not include public")
 
-    tables = _invoke(server, "list_tables", {"schema": "public"})
+    tables = _invoke(server, "db_pg96_list_tables", {"schema": "public"})
     table_names = {t.get("table_name") for t in tables}
     _assert("customers" in table_names and "orders" in table_names, "list_tables missing sample tables")
 
-    desc = _invoke(server, "describe_table", {"schema": "public", "table": "customers"})
+    desc = _invoke(server, "db_pg96_describe_table", {"schema": "public", "table": "customers"})
     _assert(desc.get("table") == "customers", "describe_table returned wrong table")
     _assert(isinstance(desc.get("columns"), list) and len(desc["columns"]) > 0, "describe_table returned no columns")
 
-    q = _invoke(server, "run_query", {"sql": "select count(*) as n from public.orders"})
+    q = _invoke(server, "db_pg96_run_query", {"sql": "select count(*) as n from public.orders"})
     _assert(q.get("returned_rows") == 1, "run_query did not return 1 row for count(*)")
 
     plan = _invoke(
         server,
-        "explain_query",
-        {"sql": "select * from public.orders where customer_id = 1 order by created_at desc limit 10", "format": "json"},
+        "db_pg96_explain_query",
+        {"sql": "select * from public.orders where customer_id = 1 order by created_at desc limit 10", "output_format": "json"},
     )
     _assert(plan.get("format") == "json", "explain_query did not return json format")
 
-    stats = _invoke(server, "db_stats", {"database": DB, "include_performance": True})
+    stats = _invoke(server, "db_pg96_db_stats", {"database": DB, "include_performance": True})
     _assert(isinstance(stats, dict) and stats.get("database") == DB, "db_stats returned wrong database")
 
-    bloat = _invoke(server, "check_bloat", {"limit": 10})
+    bloat = _invoke(server, "db_pg96_check_bloat", {"limit": 10})
     _assert(isinstance(bloat, list), "check_bloat did not return a list")
 
-    sessions = _invoke(server, "analyze_sessions", {"min_duration_seconds": 0, "min_idle_seconds": 0})
+    sessions = _invoke(server, "db_pg96_analyze_sessions", {"min_duration_seconds": 0, "min_idle_seconds": 0})
     _assert(isinstance(sessions, dict) and "summary" in sessions, "analyze_sessions returned unexpected shape")
 
-    health = _invoke(server, "analyze_table_health", {"schema": "public", "min_size_mb": 0, "limit": 10})
+    health = _invoke(server, "db_pg96_analyze_table_health", {"schema": "public", "min_size_mb": 0, "limit": 10})
     _assert(isinstance(health, dict) and "tables" in health, "analyze_table_health returned unexpected shape")
 
-    secperf = _invoke(server, "database_security_performance_metrics")
+    secperf = _invoke(server, "db_pg96_database_security_performance_metrics")
     _assert(isinstance(secperf, dict) and "issues_found" in secperf, "database_security_performance_metrics returned unexpected shape")
 
     username = f"mcp_test_user_{int(time.time())}"
     created = _invoke(
         server,
-        "create_db_user",
+        "db_pg96_create_db_user",
         {"username": username, "password": "testpass123", "privileges": "read", "database": DB},
     )
     _assert(isinstance(created, str) and username in created, "create_db_user did not return success string")
 
-    dropped = _invoke(server, "drop_db_user", {"username": username})
+    dropped = _invoke(server, "db_pg96_drop_db_user", {"username": username})
     _assert(isinstance(dropped, str) and username in dropped, "drop_db_user did not return success string")
+
+    # Test create_db_user with default database (None)
+    username_def = f"mcp_test_user_def_{int(time.time())}"
+    created_def = _invoke(
+        server,
+        "db_pg96_create_db_user",
+        {"username": username_def, "password": "testpass123", "privileges": "read"},
+    )
+    _assert(isinstance(created_def, str) and username_def in created_def, "create_db_user (default db) failed")
+    
+    dropped_def = _invoke(server, "db_pg96_drop_db_user", {"username": username_def})
+    _assert(isinstance(dropped_def, str) and username_def in dropped_def, "drop_db_user (default db) failed")
 
     dsn = f"postgresql://{USER}:{PASSWORD}@{HOST}:{PORT}/{DB}"
     victim = psycopg.connect(dsn, autocommit=True)
@@ -237,26 +250,26 @@ def _call_all_tools() -> None:
         with victim.cursor() as cur:
             cur.execute("select pg_backend_pid() as pid")
             pid = cur.fetchone()[0]
-        killed = _invoke(server, "kill_session", {"pid": pid})
+        killed = _invoke(server, "db_pg96_kill_session", {"pid": pid})
         _assert(isinstance(killed, dict) and killed.get("pid") == pid, "kill_session did not echo pid")
 
         # Additional tools added recently
-        idx_stats = _invoke(server, "analyze_indexes", {"schema": "public"})
+        idx_stats = _invoke(server, "db_pg96_analyze_indexes", {"schema": "public"})
         _assert(isinstance(idx_stats, dict) and "unused_indexes" in idx_stats, "analyze_indexes failed")
 
-        largest_tables = _invoke(server, "list_largest_tables", {"schema": "public", "limit": 5})
+        largest_tables = _invoke(server, "db_pg96_list_largest_tables", {"schema": "public", "limit": 5})
         _assert(isinstance(largest_tables, list) and len(largest_tables) > 0, "list_largest_tables failed")
 
-        temp_objs = _invoke(server, "list_temp_objects")
+        temp_objs = _invoke(server, "db_pg96_list_temp_objects")
         _assert(isinstance(temp_objs, dict) and "temp_schemas" in temp_objs, "list_temp_objects failed")
 
-        t_sizes = _invoke(server, "table_sizes", {"schema": "public", "limit": 5})
+        t_sizes = _invoke(server, "db_pg96_table_sizes", {"schema": "public", "limit": 5})
         _assert(isinstance(t_sizes, list) and len(t_sizes) > 0, "table_sizes failed")
 
-        i_usage = _invoke(server, "index_usage", {"schema": "public", "limit": 5})
+        i_usage = _invoke(server, "db_pg96_index_usage", {"schema": "public", "limit": 5})
         _assert(isinstance(i_usage, list) and len(i_usage) > 0, "index_usage failed")
 
-        m_stats = _invoke(server, "maintenance_stats", {"schema": "public", "limit": 5})
+        m_stats = _invoke(server, "db_pg96_maintenance_stats", {"schema": "public", "limit": 5})
         _assert(isinstance(m_stats, list) and len(m_stats) > 0, "maintenance_stats failed")
     finally:
         try:
