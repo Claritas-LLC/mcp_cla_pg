@@ -43,15 +43,39 @@ def main():
         print(f"Failed to start docker containers: {e}")
         sys.exit(1)
     
-    # Wait for DB to be ready
+    # Wait for DB to be ready using a real connection check
     print("Waiting for database to be ready...")
-    time.sleep(5) 
+    
+    from psycopg_pool import ConnectionPool
+    from psycopg.rows import dict_row
+
+    max_retries = 10
+    retry_delay = 2
+    
+    # Use a temporary pool to check connectivity before letting the server module take over
+    check_pool = ConnectionPool(os.environ["DATABASE_URL"], kwargs={"row_factory": dict_row})
+    
+    try:
+        for i in range(max_retries):
+            try:
+                with check_pool.connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                        print("Database is ready!")
+                        break
+            except Exception:
+                if i < max_retries - 1:
+                    print(f"Database not ready, retrying in {retry_delay}s... ({i+1}/{max_retries})")
+                    time.sleep(retry_delay)
+                else:
+                    print("Error: Database failed to become ready after multiple attempts.")
+                    check_pool.close()
+                    sys.exit(1)
+    finally:
+        check_pool.close()
 
     try:
         # Check if we can connect to the DB
-        # Re-initialize pool if needed (server.py does it on import, but just to be safe)
-        from psycopg_pool import ConnectionPool
-        from psycopg.rows import dict_row
         
         # We don't want to mess with server.pool if it's already working, 
         # but since we imported server after setting env vars, it should be fine.
