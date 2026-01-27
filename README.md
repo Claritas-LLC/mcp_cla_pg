@@ -21,41 +21,7 @@ This server exposes a suite of DBA-grade tools to inspect schemas, analyze perfo
 
 For detailed deployment instructions on **Azure Container Apps**, **AWS ECS**, and **Docker**, please see our **[Deployment Guide](DEPLOYMENT.md)**.
 
-### Option 1: Trae (Native Integration)
 
-To add this MCP server to Trae:
-
-1.  Open Trae Settings -> MCP Servers.
-2.  Add a new server with the following configuration:
-    *   **Type**: `stdio` (recommended for local) or `sse` (for remote/HTTP).
-    *   **Command**: `uv run mcp-postgres` (if running from source) or the Docker command.
-
-**Example `stdio` configuration for Trae (Local):**
-```json
-{
-  "mcpServers": {
-    "postgres-stdio": {
-      "command": "uv",
-      "args": ["run", "mcp-postgres"],
-      "env": {
-        "DATABASE_URL": "postgresql://user:password@localhost:5432/dbname",
-        "MCP_TRANSPORT": "stdio"
-      }
-    }
-  }
-}
-```
-
-**Example `sse` configuration for Trae (HTTP/Remote):**
-```json
-{
-  "mcpServers": {
-    "postgres-http": {
-      "url": "http://your-server-address:8000/mcp"
-    }
-  }
-}
-```
 
 ### Option 2: VS Code & Claude Desktop
 
