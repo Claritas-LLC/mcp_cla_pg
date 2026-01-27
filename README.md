@@ -404,5 +404,6 @@ If you have an idea, please submit a feature request!
 
 For comments, issues, or feature enhancements, please contact the maintainer or submit an issue to the repository:
 
+- **Repository**: https://github.com/harryvaldez/mcp_cla_pg
 - **Maintainer**: Harry Valdez
-- **Issues**: Submit to the project repository
+- **Issues**: https://github.com/harryvaldez/mcp_cla_pg/issues
