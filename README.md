@@ -1,6 +1,6 @@
 # PostgreSQL MCP Server
 
-A powerful Model Context Protocol (MCP) server for PostgreSQL database administration, designed for AI agents like **Trae**, **Claude**, and **Codex**.
+A powerful Model Context Protocol (MCP) server for PostgreSQL database administration, designed for AI agents like **VS Code**, **Claude**, and **Codex**.
 
 This server exposes a suite of DBA-grade tools to inspect schemas, analyze performance, check security, and troubleshoot issues—all through a safe, controlled interface.
 
@@ -14,6 +14,7 @@ This server exposes a suite of DBA-grade tools to inspect schemas, analyze perfo
 - **Multiple Transports**: Supports `http` (uses SSE) and `stdio`. HTTPS is supported via SSL configuration variables.
 - **Secure Authentication**: Built-in support for **Azure AD (Microsoft Entra ID)** and standard token auth.
 - **HTTPS Support**: Native SSL/TLS support for secure remote connections.
+- **SSH Tunneling**: Built-in support for connecting via SSH bastion hosts.
 - **Python 3.13**: Built on the latest Python runtime for improved performance and security.
 - **Broad Compatibility**: Fully tested with **PostgreSQL 9.6+**. (Note: PostgreSQL 9.6 reached EOL in Nov 2021; we recommend using supported releases, e.g., PostgreSQL 12+, for production.)
 
@@ -79,6 +80,23 @@ docker run -d \
   -e FASTMCP_AZURE_AD_TENANT_ID=... \
   -e FASTMCP_AZURE_AD_CLIENT_ID=... \
   -p 8001:8000 \
+  harryvaldez/mcp-postgres:latest
+```
+
+### Option 2b: Docker with SSH Tunneling
+
+To connect to a database behind a bastion host (e.g., in a private subnet), you can mount your SSH key and configure the tunnel variables:
+
+```bash
+docker run -d \
+  --name mcp-postgres-ssh \
+  -v ~/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
+  -e DATABASE_URL=postgresql://user:password@db-internal-host:5432/dbname \
+  -e SSH_HOST=bastion.example.com \
+  -e SSH_USER=ec2-user \
+  -e SSH_PKEY="/root/.ssh/id_rsa" \
+  -e MCP_TRANSPORT=http \
+  -p 8000:8000 \
   harryvaldez/mcp-postgres:latest
 ```
 
@@ -168,6 +186,19 @@ To enable HTTPS, provide both the certificate and key files.
 |----------|-------------|
 | `MCP_SSL_CERT` | Path to SSL certificate file (`.crt` or `.pem`) |
 | `MCP_SSL_KEY` | Path to SSL private key file (`.key`) |
+
+### SSH Tunneling
+To access a PostgreSQL database behind a bastion host, configure the following SSH variables. The server will automatically establish a secure tunnel.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SSH_HOST` | Bastion/Jump host address | *None* |
+| `SSH_USER` | SSH username | *None* |
+| `SSH_PASSWORD` | SSH password (optional) | *None* |
+| `SSH_PKEY` | Path to private key file (optional) | *None* |
+| `SSH_PORT` | SSH port | `22` |
+
+> **Note**: When SSH is enabled, the `DATABASE_URL` should point to the database host as seen from the *bastion* (e.g., internal IP or RDS endpoint).
 
 ---
 

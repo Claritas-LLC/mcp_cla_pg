@@ -5,10 +5,13 @@ import logging
 import os
 import re
 import sys
+import atexit
+import signal
 from datetime import timedelta
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, urlunparse, urlsplit, urlunsplit
 from typing import Any
 
+from sshtunnel import SSHTunnelForwarder
 from fastmcp import FastMCP
 from psycopg import Error as PsycopgError
 from psycopg import sql
@@ -196,6 +199,18 @@ if not DATABASE_URL:
         "Missing DATABASE_URL or PGHOST/PGUSER/PGDATABASE environment variables"
     )
 
+# Capture original connection details before any SSH tunneling modification
+# This ensures we report the correct target server info to the user
+try:
+    _parsed_initial = urlparse(DATABASE_URL)
+    ORIGINAL_DB_HOST = _parsed_initial.hostname
+    ORIGINAL_DB_PORT = _parsed_initial.port or 5432
+    ORIGINAL_DB_NAME = _parsed_initial.path.lstrip('/')
+except Exception:
+    ORIGINAL_DB_HOST = None
+    ORIGINAL_DB_PORT = None
+    ORIGINAL_DB_NAME = None
+
 if os.environ.get("MCP_ALLOW_WRITE") is None:
     raise RuntimeError("MCP_ALLOW_WRITE environment variable is required (e.g. 'true' or 'false')")
 
@@ -228,6 +243,100 @@ POOL_MAX_SIZE = _env_int("MCP_POOL_MAX_SIZE", 20)
 POOL_TIMEOUT = float(os.environ.get("MCP_POOL_TIMEOUT", "60.0"))
 POOL_MAX_WAITING = _env_int("MCP_POOL_MAX_WAITING", 20)
 STATEMENT_TIMEOUT_MS = _env_int("MCP_STATEMENT_TIMEOUT_MS", 120000) # 120s default
+
+
+# SSH Tunnel Configuration
+SSH_HOST = os.environ.get("SSH_HOST")
+SSH_USER = os.environ.get("SSH_USER")
+SSH_PASSWORD = os.environ.get("SSH_PASSWORD")
+SSH_PKEY = os.environ.get("SSH_PKEY")
+SSH_PORT = _env_int("SSH_PORT", 22)
+
+# Global reference to keep tunnel alive
+_ssh_tunnel = None
+
+if SSH_HOST and SSH_USER:
+    logger.info(f"Configuring SSH tunnel to {SSH_USER}@{SSH_HOST}:{SSH_PORT}...")
+    
+    # Parse destination from DATABASE_URL
+    # DATABASE_URL is guaranteed to be set by previous checks
+    try:
+        parsed_db_url = urlparse(DATABASE_URL)
+        
+        remote_bind_host = parsed_db_url.hostname
+        remote_bind_port = parsed_db_url.port or 5432
+        
+        if not remote_bind_host:
+            raise RuntimeError(
+                "SSH requested but DATABASE_URL lacks a host. Provide a URL like postgresql://user:pass@host:5432/db"
+            )
+    
+        # Read allow_agent configuration from environment variable
+        allow_ssh_agent = os.environ.get("ALLOW_SSH_AGENT", "false").lower() in ("true", "1", "yes", "on")
+        
+        ssh_args = {
+            "ssh_address_or_host": (SSH_HOST, SSH_PORT),
+            "ssh_username": SSH_USER,
+            "remote_bind_address": (remote_bind_host, remote_bind_port),
+            "allow_agent": allow_ssh_agent, # Configurable via ALLOW_SSH_AGENT environment variable
+        }
+        
+        if SSH_PASSWORD:
+            ssh_args["ssh_password"] = SSH_PASSWORD
+        if SSH_PKEY:
+            ssh_args["ssh_pkey"] = SSH_PKEY
+            
+        logger.info(f"Starting SSH tunnel to remote bind: {remote_bind_host}:{remote_bind_port}")
+        _ssh_tunnel = SSHTunnelForwarder(**ssh_args)
+        _ssh_tunnel.start()
+        
+        logger.info(f"SSH tunnel established. Local bind port: {_ssh_tunnel.local_bind_port}")
+        
+        # Reconstruct DATABASE_URL with local port using robust split/unsplit to preserve components
+        parts = urlsplit(DATABASE_URL)
+        userinfo = ''
+        if parts.username:
+            userinfo = parts.username
+            if parts.password:
+                userinfo += f":{quote(parts.password)}"
+            userinfo += '@'
+        new_netloc = f"{userinfo}127.0.0.1:{_ssh_tunnel.local_bind_port}"
+        DATABASE_URL = urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
+        
+        logger.info("Updated DATABASE_URL to use SSH tunnel.")
+        
+    except Exception as e:
+        logger.error(f"Failed to establish SSH tunnel: {e}")
+        # We raise here because if the user asked for SSH and it fails, we shouldn't proceed
+        # attempting to connect directly (which would likely timeout or fail anyway)
+        raise RuntimeError(f"SSH Tunnel setup failed: {e}") from e
+
+
+def _cleanup_ssh_tunnel():
+    """Cleanup function to stop SSH tunnel on process exit."""
+    global _ssh_tunnel
+    if _ssh_tunnel is not None:
+        try:
+            logger.info("Closing SSH tunnel...")
+            _ssh_tunnel.stop()
+            _ssh_tunnel = None
+            logger.info("SSH tunnel closed.")
+        except Exception as e:
+            logger.error(f"Error closing SSH tunnel: {e}")
+
+
+# Register cleanup handlers
+atexit.register(_cleanup_ssh_tunnel)
+
+# Register signal handlers for graceful shutdown
+def _signal_handler(signum, frame):
+    logger.info(f"Received signal {signum}, cleaning up...")
+    _cleanup_ssh_tunnel()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
 
 pool = ConnectionPool(
     conninfo=DATABASE_URL,
@@ -1676,11 +1785,14 @@ def db_pg96_server_info() -> dict[str, Any]:
             if row is None:
                 raise RuntimeError("Failed to retrieve server info: database query returned no rows")
                 
+            db_name = ORIGINAL_DB_NAME if ORIGINAL_DB_NAME else row["database"]
+            server_addr = ORIGINAL_DB_HOST if ORIGINAL_DB_HOST else row["server_addr"]
+            server_port = ORIGINAL_DB_PORT if ORIGINAL_DB_PORT else row["server_port"]
             return {
-                "database": row["database"],
+                "database": db_name,
                 "user": row["user"],
-                "server_addr": row["server_addr"],
-                "server_port": row["server_port"],
+                "server_addr": server_addr,
+                "server_port": server_port,
                 "version": row["version"],
                 "allow_write": ALLOW_WRITE,
                 "default_max_rows": DEFAULT_MAX_ROWS,
@@ -2741,7 +2853,7 @@ def db_pg96_server_info_mcp() -> dict[str, Any]:
         "version": "1.0.0",
         "status": "healthy",
         "transport": os.environ.get("MCP_TRANSPORT", "http"),
-        "database": database_name
+        "database": ORIGINAL_DB_NAME or database_name
     }
 
 
