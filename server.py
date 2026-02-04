@@ -637,6 +637,620 @@ def db_pg96_drop_db_user(username: str) -> str:
 
 
 @mcp.tool
+def db_pg96_alter_object(
+    object_type: str,
+    object_name: str,
+    operation: str,
+    schema: str | None = None,
+    owner: str | None = None,
+    parameters: dict[str, Any] | None = None
+) -> str:
+    """
+    Executes ALTER DDL statements for database objects.
+    
+    Args:
+        object_type: One of: database, schema, table, view, index, function, procedure, trigger, server.
+        object_name: Name of the object.
+        operation: One of: rename, owner_to, set_schema, add_column, rename_column, alter_column, drop_column, rename_constraint, attach_partition, detach_partition.
+        schema: Schema name (required for schema-scoped objects).
+        owner: New owner name (for 'owner_to' operation).
+        parameters: Additional parameters for specific operations:
+            - new_name: for 'rename' (target name)
+            - new_schema: for 'set_schema'
+            - column_name: for column operations
+            - new_column_name: for 'rename_column'
+            - data_type: for 'add_column', 'alter_column'
+            - constraint_name: for 'rename_constraint'
+            - new_constraint_name: for 'rename_constraint'
+            - partition_name: for partition operations
+            - bounds: for 'attach_partition' (e.g., "FOR VALUES IN (1)")
+            - table_name: for 'trigger' operations (the table the trigger is on)
+            - function_args: for 'function'/'procedure' (e.g., "integer, text") to identify specific overload
+            - not_null: bool, for 'alter_column'
+            - default: any, for 'alter_column' (SET DEFAULT)
+            - drop_default: bool, for 'alter_column'
+            - constraints: str, for 'add_column' (e.g. "NOT NULL DEFAULT 0")
+    """
+    if not ALLOW_WRITE:
+        raise ValueError("Write operations are disabled. Set MCP_ALLOW_WRITE=true to enable.")
+
+    params = parameters or {}
+    op = operation.lower()
+    obj_type = object_type.lower()
+    
+    # Normalize object types
+    if obj_type == 'procedure':
+        obj_type = 'function' # PG 9.6 treats procedures as functions
+    
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            query = None
+            
+            # Base object identifier construction
+            if schema and obj_type not in ('database', 'server', 'schema'):
+                # For functions, we might need args signature
+                if obj_type == 'function' and params.get('function_args'):
+                     # Format: "schema"."name"(args) - args are raw SQL
+                     obj_id = sql.SQL("{}.{}({})").format(
+                         sql.Identifier(schema),
+                         sql.Identifier(object_name),
+                         sql.SQL(params['function_args'])
+                     )
+                else:
+                    obj_id = sql.Identifier(schema, object_name)
+            else:
+                if obj_type == 'function' and params.get('function_args'):
+                     obj_id = sql.SQL("{}({})").format(
+                         sql.Identifier(object_name),
+                         sql.SQL(params['function_args'])
+                     )
+                else:
+                    obj_id = sql.Identifier(object_name)
+
+            # --- Universal Operations ---
+            
+            if op == 'rename':
+                new_name = params.get('new_name')
+                if not new_name:
+                    raise ValueError("Parameter 'new_name' required for rename.")
+                
+                # Triggers are special: ALTER TRIGGER name ON table RENAME TO new_name
+                if obj_type == 'trigger':
+                    table_name = params.get('table_name')
+                    if not table_name:
+                        raise ValueError("Parameter 'table_name' required for altering triggers.")
+                    query = sql.SQL("ALTER TRIGGER {} ON {} RENAME TO {}").format(
+                        sql.Identifier(object_name),
+                        sql.Identifier(schema, table_name) if schema else sql.Identifier(table_name),
+                        sql.Identifier(new_name)
+                    )
+                else:
+                    query = sql.SQL("ALTER {} {} RENAME TO {}").format(
+                        sql.SQL(obj_type.upper()),
+                        obj_id,
+                        sql.Identifier(new_name)
+                    )
+
+            elif op == 'owner_to':
+                if not owner:
+                    raise ValueError("Parameter 'owner' required for owner_to operation.")
+                
+                if obj_type == 'trigger':
+                    raise ValueError("Triggers do not have owners (tables do).")
+                
+                query = sql.SQL("ALTER {} {} OWNER TO {}").format(
+                    sql.SQL(obj_type.upper()),
+                    obj_id,
+                    sql.Identifier(owner)
+                )
+
+            elif op == 'set_schema':
+                new_schema = params.get('new_schema')
+                if not new_schema:
+                    raise ValueError("Parameter 'new_schema' required for set_schema.")
+                
+                if obj_type in ('database', 'server', 'schema'):
+                    raise ValueError(f"Cannot set schema for {obj_type}.")
+                
+                query = sql.SQL("ALTER {} {} SET SCHEMA {}").format(
+                    sql.SQL(obj_type.upper()),
+                    obj_id,
+                    sql.Identifier(new_schema)
+                )
+
+            # --- Table Specific Operations ---
+            
+            elif obj_type == 'table':
+                if op == 'add_column':
+                    col_name = params.get('column_name')
+                    dtype = params.get('data_type')
+                    if not col_name or not dtype:
+                        raise ValueError("Parameters 'column_name' and 'data_type' required.")
+                    
+                    constraints = params.get('constraints', '')
+                    
+                    query = sql.SQL("ALTER TABLE {} ADD COLUMN {} {} {}").format(
+                        obj_id,
+                        sql.Identifier(col_name),
+                        sql.SQL(dtype),
+                        sql.SQL(constraints)
+                    )
+                    
+                elif op == 'rename_column':
+                    col_name = params.get('column_name')
+                    new_col_name = params.get('new_column_name')
+                    if not col_name or not new_col_name:
+                        raise ValueError("Parameters 'column_name' and 'new_column_name' required.")
+                        
+                    query = sql.SQL("ALTER TABLE {} RENAME COLUMN {} TO {}").format(
+                        obj_id,
+                        sql.Identifier(col_name),
+                        sql.Identifier(new_col_name)
+                    )
+                    
+                elif op == 'drop_column':
+                    col_name = params.get('column_name')
+                    if not col_name:
+                        raise ValueError("Parameter 'column_name' required.")
+                        
+                    query = sql.SQL("ALTER TABLE {} DROP COLUMN {}").format(
+                        obj_id,
+                        sql.Identifier(col_name)
+                    )
+
+                elif op == 'alter_column':
+                    col_name = params.get('column_name')
+                    if not col_name:
+                        raise ValueError("Parameter 'column_name' required.")
+                    
+                    sub_ops = []
+                    if params.get('data_type'):
+                        sub_ops.append(sql.SQL("TYPE {}").format(sql.SQL(params['data_type'])))
+                    
+                    if params.get('not_null') is True:
+                        sub_ops.append(sql.SQL("SET NOT NULL"))
+                    elif params.get('not_null') is False:
+                        sub_ops.append(sql.SQL("DROP NOT NULL"))
+                        
+                    if params.get('default'):
+                        sub_ops.append(sql.SQL("SET DEFAULT {}").format(sql.Literal(params['default'])))
+                    elif params.get('drop_default'):
+                        sub_ops.append(sql.SQL("DROP DEFAULT"))
+
+                    if not sub_ops:
+                         raise ValueError("No alteration specified for column (data_type, not_null, default).")
+                    
+                    actions = []
+                    for action in sub_ops:
+                        actions.append(sql.SQL("ALTER COLUMN {} {}").format(sql.Identifier(col_name), action))
+                    
+                    query = sql.SQL("ALTER TABLE {} {}").format(
+                        obj_id,
+                        sql.SQL(", ").join(actions)
+                    )
+
+                elif op == 'rename_constraint':
+                    con_name = params.get('constraint_name')
+                    new_con_name = params.get('new_constraint_name')
+                    if not con_name or not new_con_name:
+                        raise ValueError("Parameters 'constraint_name' and 'new_constraint_name' required.")
+                        
+                    query = sql.SQL("ALTER TABLE {} RENAME CONSTRAINT {} TO {}").format(
+                        obj_id,
+                        sql.Identifier(con_name),
+                        sql.Identifier(new_con_name)
+                    )
+                    
+                elif op == 'attach_partition':
+                    part_name = params.get('partition_name')
+                    bounds = params.get('bounds')
+                    if not part_name or not bounds:
+                         raise ValueError("Parameters 'partition_name' and 'bounds' required.")
+                    
+                    if '.' in part_name:
+                        s, n = part_name.split('.', 1)
+                        part_id = sql.Identifier(s, n)
+                    else:
+                        part_id = sql.Identifier(part_name)
+
+                    query = sql.SQL("ALTER TABLE {} ATTACH PARTITION {} {}").format(
+                        obj_id,
+                        part_id,
+                        sql.SQL(bounds)
+                    )
+
+                elif op == 'detach_partition':
+                    part_name = params.get('partition_name')
+                    if not part_name:
+                         raise ValueError("Parameter 'partition_name' required.")
+                    
+                    if '.' in part_name:
+                        s, n = part_name.split('.', 1)
+                        part_id = sql.Identifier(s, n)
+                    else:
+                        part_id = sql.Identifier(part_name)
+                        
+                    query = sql.SQL("ALTER TABLE {} DETACH PARTITION {}").format(
+                        obj_id,
+                        part_id
+                    )
+
+            if not query:
+                raise ValueError(f"Operation '{op}' not supported for object type '{obj_type}' or parameters missing.")
+
+            logger.info(f"Executing ALTER: {query.as_string(conn)}")
+            _execute_safe(cur, query)
+            
+            return f"Operation '{op}' on {obj_type} '{object_name}' completed successfully."
+
+
+@mcp.tool
+def db_pg96_create_object(
+    object_type: str,
+    object_name: str,
+    schema: str | None = None,
+    owner: str | None = None,
+    parameters: dict[str, Any] | None = None
+) -> str:
+    """
+    Executes CREATE DDL statements for database objects.
+    
+    Args:
+        object_type: One of: database, schema, table, view, index, function, procedure, trigger, server.
+        object_name: Name of the object.
+        schema: Schema name (required for schema-scoped objects like table, view, index, function, trigger).
+        owner: Optional owner of the object (AUTHORIZATION clause).
+        parameters: Additional parameters for specific objects:
+            - columns: list of dicts for 'table' (e.g. [{'name': 'id', 'type': 'serial', 'constraints': 'PRIMARY KEY'}])
+            - query: str for 'view' (AS query)
+            - table_name: str for 'index' or 'trigger'
+            - index_columns: list of str for 'index' (column names or expressions)
+            - unique: bool for 'index'
+            - method: str for 'index' (e.g. 'btree', 'gin')
+            - function_args: str for 'function'/'procedure' (e.g. "a integer, b text")
+            - return_type: str for 'function' (e.g. "integer")
+            - language: str for 'function' (e.g. "plpgsql")
+            - body: str for 'function' body
+            - replace: bool (CREATE OR REPLACE)
+            - fdw_name: str for 'server'
+            - options: str/dict for 'server' options
+            - event: str for 'trigger' (e.g. "BEFORE INSERT")
+            - function_name: str for 'trigger' execution
+    """
+    if not ALLOW_WRITE:
+        raise ValueError("Write operations are disabled. Set MCP_ALLOW_WRITE=true to enable.")
+
+    params = parameters or {}
+    obj_type = object_type.lower()
+    
+    # Normalize object types
+    if obj_type == 'procedure':
+        obj_type = 'function' # PG 9.6
+        
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            query = None
+            
+            # --- Database ---
+            if obj_type == 'database':
+                # CREATE DATABASE name [OWNER user]
+                parts = [sql.SQL("CREATE DATABASE"), sql.Identifier(object_name)]
+                if owner:
+                    parts.append(sql.SQL("OWNER"))
+                    parts.append(sql.Identifier(owner))
+                query = sql.SQL(" ").join(parts)
+            
+            # --- Schema ---
+            elif obj_type == 'schema':
+                # CREATE SCHEMA name [AUTHORIZATION user]
+                parts = [sql.SQL("CREATE SCHEMA"), sql.Identifier(object_name)]
+                if owner:
+                    parts.append(sql.SQL("AUTHORIZATION"))
+                    parts.append(sql.Identifier(owner))
+                query = sql.SQL(" ").join(parts)
+
+            # --- Table ---
+            elif obj_type == 'table':
+                if not schema:
+                    raise ValueError("Parameter 'schema' required for creating table.")
+                
+                cols = params.get('columns', [])
+                if not cols:
+                    raise ValueError("Parameter 'columns' (list) required for creating table.")
+                
+                col_defs = []
+                for col in cols:
+                    c_name = col.get('name')
+                    c_type = col.get('type')
+                    if not c_name or not c_type:
+                        raise ValueError("Column definition requires 'name' and 'type'.")
+                    
+                    c_parts = [sql.Identifier(c_name), sql.SQL(c_type)]
+                    if col.get('constraints'):
+                        c_parts.append(sql.SQL(col['constraints']))
+                    col_defs.append(sql.SQL(" ").join(c_parts))
+                
+                query = sql.SQL("CREATE TABLE {}.{} ({})").format(
+                    sql.Identifier(schema),
+                    sql.Identifier(object_name),
+                    sql.SQL(", ").join(col_defs)
+                )
+                
+                if owner:
+                     # Owner is usually set via ALTER after CREATE for tables, or part of CREATE TABLE logic?
+                     # PG CREATE TABLE doesn't have OWNER clause directly, it defaults to current user.
+                     # We can run ALTER afterwards if needed, but let's stick to CREATE.
+                     pass
+
+            # --- View ---
+            elif obj_type == 'view':
+                if not schema:
+                    raise ValueError("Parameter 'schema' required for creating view.")
+                
+                view_query = params.get('query')
+                if not view_query:
+                    raise ValueError("Parameter 'query' required for creating view.")
+                
+                replace = "OR REPLACE" if params.get('replace') else ""
+                
+                query = sql.SQL("CREATE {} VIEW {}.{} AS {}").format(
+                    sql.SQL(replace),
+                    sql.Identifier(schema),
+                    sql.Identifier(object_name),
+                    sql.SQL(view_query)
+                )
+
+            # --- Index ---
+            elif obj_type == 'index':
+                if not schema:
+                    raise ValueError("Parameter 'schema' required for creating index.")
+                
+                table_name = params.get('table_name')
+                if not table_name:
+                    raise ValueError("Parameter 'table_name' required for creating index.")
+                
+                idx_cols = params.get('index_columns', [])
+                if not idx_cols:
+                    raise ValueError("Parameter 'index_columns' required for creating index.")
+                
+                unique = "UNIQUE" if params.get('unique') else ""
+                method = params.get('method', 'btree') # default btree
+                
+                # Columns can be expressions, so we trust input string for columns but wrap in parens if not present?
+                # Usually list of column names.
+                col_parts = []
+                for c in idx_cols:
+                     # If it looks like an identifier, use Identifier, else SQL (expression)
+                     # Simple heuristic: if no spaces/parens, Identifier.
+                     if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", c):
+                         col_parts.append(sql.Identifier(c))
+                     else:
+                         col_parts.append(sql.SQL(c))
+
+                query = sql.SQL("CREATE {} INDEX {} ON {}.{} USING {} ({})").format(
+                    sql.SQL(unique),
+                    sql.Identifier(object_name),
+                    sql.Identifier(schema),
+                    sql.Identifier(table_name),
+                    sql.Identifier(method), # method is an identifier like btree
+                    sql.SQL(", ").join(col_parts)
+                )
+
+            # --- Function ---
+            elif obj_type == 'function':
+                if not schema:
+                    raise ValueError("Parameter 'schema' required for creating function.")
+                
+                args = params.get('function_args', '')
+                ret_type = params.get('return_type', 'void')
+                lang = params.get('language', 'plpgsql')
+                body = params.get('body')
+                if not body:
+                     raise ValueError("Parameter 'body' required for creating function.")
+                
+                replace = "OR REPLACE" if params.get('replace') else ""
+                
+                query = sql.SQL("CREATE {} FUNCTION {}.{}({}) RETURNS {} AS {} LANGUAGE {}").format(
+                    sql.SQL(replace),
+                    sql.Identifier(schema),
+                    sql.Identifier(object_name),
+                    sql.SQL(args),
+                    sql.SQL(ret_type),
+                    sql.Literal(body), # Body as string literal
+                    sql.Identifier(lang)
+                )
+
+            # --- Trigger ---
+            elif obj_type == 'trigger':
+                if not schema:
+                    raise ValueError("Parameter 'schema' required for creating trigger.")
+                
+                table_name = params.get('table_name')
+                event = params.get('event') # e.g. "BEFORE INSERT"
+                func_name = params.get('function_name')
+                if not table_name or not event or not func_name:
+                    raise ValueError("Parameters 'table_name', 'event', 'function_name' required.")
+                
+                # TRIGGER is on TABLE. 
+                query = sql.SQL("CREATE TRIGGER {} {} ON {}.{} FOR EACH ROW EXECUTE PROCEDURE {}").format(
+                    sql.Identifier(object_name),
+                    sql.SQL(event),
+                    sql.Identifier(schema),
+                    sql.Identifier(table_name),
+                    sql.SQL(func_name) # function name might be schema qualified in string
+                )
+
+            # --- Server ---
+            elif obj_type == 'server':
+                fdw = params.get('fdw_name')
+                if not fdw:
+                     raise ValueError("Parameter 'fdw_name' required for creating server.")
+                
+                opts = params.get('options')
+                opt_sql = sql.SQL("")
+                if opts:
+                    # options typically: OPTIONS (host 'foo', port '5432')
+                    # If dict provided:
+                    if isinstance(opts, dict):
+                        opt_list = []
+                        for k, v in opts.items():
+                            opt_list.append(sql.SQL("{} {}").format(sql.Identifier(k), sql.Literal(v)))
+                        opt_sql = sql.SQL("OPTIONS ({})").format(sql.SQL(", ").join(opt_list))
+                    else:
+                        opt_sql = sql.SQL(opts) # raw string
+
+                query = sql.SQL("CREATE SERVER {} FOREIGN DATA WRAPPER {} {}").format(
+                    sql.Identifier(object_name),
+                    sql.Identifier(fdw),
+                    opt_sql
+                )
+
+            else:
+                raise ValueError(f"Creation of object type '{obj_type}' not supported.")
+
+            logger.info(f"Executing CREATE: {query.as_string(conn)}")
+            _execute_safe(cur, query)
+            
+            # Post-creation steps (like owner)
+            if owner and obj_type in ('table', 'view', 'function', 'sequence'):
+                 # Apply ownership if provided and not handled in create
+                 owner_query = sql.SQL("ALTER {} {}.{} OWNER TO {}").format(
+                     sql.SQL(obj_type.upper()),
+                     sql.Identifier(schema),
+                     sql.Identifier(object_name),
+                     sql.Identifier(owner)
+                 )
+                 _execute_safe(cur, owner_query)
+
+            return f"{obj_type.capitalize()} '{object_name}' created successfully."
+
+
+@mcp.tool
+def db_pg96_drop_object(
+    object_type: str,
+    object_name: str,
+    schema: str | None = None,
+    parameters: dict[str, Any] | None = None
+) -> str:
+    """
+    Executes DROP DDL statements for database objects.
+    
+    Args:
+        object_type: One of: database, schema, table, view, index, function, procedure, trigger, server.
+        object_name: Name of the object.
+        schema: Schema name (required for schema-scoped objects).
+        parameters: Additional parameters:
+            - cascade: bool (DROP ... CASCADE)
+            - if_exists: bool (DROP ... IF EXISTS)
+            - table_name: str (required for 'trigger')
+            - function_args: str (signature for 'function'/'procedure', e.g. "int, text")
+    """
+    if not ALLOW_WRITE:
+        raise ValueError("Write operations are disabled. Set MCP_ALLOW_WRITE=true to enable.")
+
+    params = parameters or {}
+    obj_type = object_type.lower()
+    
+    # Normalize object types
+    if obj_type == 'procedure':
+        obj_type = 'function' # PG 9.6
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            
+            # Common clauses
+            if_exists = sql.SQL("IF EXISTS") if params.get('if_exists') else sql.SQL("")
+            cascade = sql.SQL("CASCADE") if params.get('cascade') else sql.SQL("")
+            
+            query = None
+            
+            # --- Database ---
+            if obj_type == 'database':
+                # DROP DATABASE [IF EXISTS] name
+                # Note: Cannot drop the currently open database.
+                query = sql.SQL("DROP DATABASE {} {}").format(
+                    if_exists,
+                    sql.Identifier(object_name)
+                )
+
+            # --- Server ---
+            elif obj_type == 'server':
+                query = sql.SQL("DROP SERVER {} {} {}").format(
+                    if_exists,
+                    sql.Identifier(object_name),
+                    cascade
+                )
+            
+            # --- Schema ---
+            elif obj_type == 'schema':
+                query = sql.SQL("DROP SCHEMA {} {} {}").format(
+                    if_exists,
+                    sql.Identifier(object_name),
+                    cascade
+                )
+
+            # --- Trigger ---
+            elif obj_type == 'trigger':
+                if not schema:
+                     raise ValueError("Parameter 'schema' required for dropping trigger.")
+                
+                table_name = params.get('table_name')
+                if not table_name:
+                    raise ValueError("Parameter 'table_name' required for dropping trigger.")
+                
+                query = sql.SQL("DROP TRIGGER {} {} ON {}.{} {}").format(
+                    if_exists,
+                    sql.Identifier(object_name),
+                    sql.Identifier(schema),
+                    sql.Identifier(table_name),
+                    cascade
+                )
+
+            # --- Function / Procedure ---
+            elif obj_type == 'function':
+                if not schema:
+                     raise ValueError("Parameter 'schema' required for dropping function.")
+                
+                # If args provided, include them in signature
+                args = params.get('function_args')
+                if args:
+                    obj_id = sql.SQL("{}.{}({})").format(
+                        sql.Identifier(schema),
+                        sql.Identifier(object_name),
+                        sql.SQL(args)
+                    )
+                else:
+                    obj_id = sql.Identifier(schema, object_name)
+                
+                query = sql.SQL("DROP FUNCTION {} {} {}").format(
+                    if_exists,
+                    obj_id,
+                    cascade
+                )
+
+            # --- Table, View, Index ---
+            elif obj_type in ('table', 'view', 'index'):
+                if not schema:
+                     raise ValueError(f"Parameter 'schema' required for dropping {obj_type}.")
+                
+                query = sql.SQL("DROP {} {} {}.{} {}").format(
+                    sql.SQL(obj_type.upper()),
+                    if_exists,
+                    sql.Identifier(schema),
+                    sql.Identifier(object_name),
+                    cascade
+                )
+
+            else:
+                raise ValueError(f"Dropping object type '{obj_type}' not supported.")
+
+            logger.info(f"Executing DROP: {query.as_string(conn)}")
+            _execute_safe(cur, query)
+            
+            return f"{obj_type.capitalize()} '{object_name}' dropped successfully."
+
+
+@mcp.tool
 def db_pg96_check_bloat(limit: int = 50) -> list[dict[str, Any]]:
     """
     Identifies the top bloated tables and indexes and provides maintenance commands.

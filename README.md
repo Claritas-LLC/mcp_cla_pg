@@ -252,6 +252,9 @@ This server implements strict security practices for logging:
 - `db_pg96_drop_db_user(username: str)`: Remove a role.
 - `db_pg96_kill_session(pid: int)`: Terminate a specific backend PID.
 - `db_pg96_run_query(sql: str, params_json: str | None = None, max_rows: int | None = None)`: Execute ad-hoc SQL. `max_rows` defaults to 500 (configurable via `MCP_MAX_ROWS`). Returns up to `max_rows` rows; if truncated, `truncated: true` is set.
+- `db_pg96_create_object(object_type: str, object_name: str, schema: str = None, owner: str = None, parameters: dict = None)`: Create database objects (table, view, index, function, etc.).
+- `db_pg96_alter_object(object_type: str, object_name: str, operation: str, schema: str = None, owner: str = None, parameters: dict = None)`: Modify database objects (add/rename column, set owner, etc.).
+- `db_pg96_drop_object(object_type: str, object_name: str, schema: str = None, parameters: dict = None)`: Drop database objects with optional `cascade` or `if_exists`.
 
 ---
 
