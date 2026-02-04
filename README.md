@@ -224,10 +224,13 @@ This server implements strict security practices for logging:
 - `db_pg96_server_info_mcp()`: Get internal MCP server status and version.
 
 ### 🔍 Schema Discovery
-- `db_pg96_list_objects(object_type: str, schema: str = None, owner: str = None, name_pattern: str = None, order_by: str = None, limit: int = 50)`: **(Consolidated Tool)** Unified tool to list databases, schemas, tables, views, indexes, functions, sequences, and temporary objects. Supports filtering and sorting. 
-    - Use `object_type='table', order_by='size'` for table sizes.
-    - Use `object_type='table', order_by='dead_tuples'` for maintenance stats.
-    - Use `object_type='index', order_by='scans'` for index usage.
+- `db_pg96_list_objects`: **(Consolidated Tool)** Unified tool to list databases, schemas, tables, views, indexes, functions, sequences, and temporary objects.
+    - **Signature**: `db_pg96_list_objects(object_type: str, schema: str = None, owner: str = None, name_pattern: str = None, order_by: str = None, limit: int = 50)`
+    - **Common Use Cases**:
+        - **Table Sizes**: `object_type='table', order_by='size'`
+        - **Maintenance Stats**: `object_type='table', order_by='dead_tuples'`
+        - **Index Usage**: `object_type='index', order_by='scans'`
+        - **Find Function**: `object_type='function', name_pattern='%my_func%'`
 - `db_pg96_describe_table(schema: str, table: str)`: Get detailed column and index info for a table.
 - `db_pg96_analyze_logical_data_model(schema: str = "public")`: **(Interactive)** Generates a comprehensive HTML report with a **Mermaid.js Entity Relationship Diagram (ERD)**, a **Health Score** (0-100), and detailed findings on normalization, missing keys, and naming conventions. The tool returns a URL to view the report in your browser.
 
@@ -434,6 +437,35 @@ The analysis of the `smsadmin` schema reveals a significant lack of structural e
  
  (Opens a dashboard with a live line graph of active vs. inactive sessions, refreshing every 5 seconds)
 
+
+### 8. List Top 10 Largest Tables (Consolidated Tool)
+**Prompt:** `using postgres_readonly, call db_pg96_list_objects(object_type='table', order_by='size', limit=10) and display results`
+
+**Result:**
+```json
+[
+  {
+    "schema": "smsadmin",
+    "name": "sms_fe_zp6_2025",
+    "owner": "sms_user",
+    "size_pretty": "38 GB",
+    "size_bytes": 41355673600,
+    "rows": 150000000,
+    "dead_tuples": 25000,
+    "last_vacuum": "2025-01-20T10:00:00"
+  },
+  {
+    "schema": "public",
+    "name": "audit_logs",
+    "owner": "postgres",
+    "size_pretty": "5 GB",
+    "size_bytes": 5368709120,
+    "rows": 2000000,
+    "dead_tuples": 0,
+    "last_vacuum": "2025-02-01T12:00:00"
+  }
+]
+```
 
 ---
 
