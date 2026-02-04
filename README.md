@@ -76,6 +76,7 @@ docker run -d \
   -e MCP_TRANSPORT=http \
   -e MCP_ALLOW_WRITE=true \
   -e MCP_CONFIRM_WRITE=true \
+  # ⚠️ Untested / Not Production Ready
   -e FASTMCP_AUTH_TYPE=azure-ad \
   -e FASTMCP_AZURE_AD_TENANT_ID=... \
   -e FASTMCP_AZURE_AD_CLIENT_ID=... \
@@ -121,7 +122,7 @@ uv run .
 export MCP_TRANSPORT=http
 export MCP_ALLOW_WRITE=true
 export MCP_CONFIRM_WRITE=true
-export FASTMCP_AUTH_TYPE=azure-ad
+export FASTMCP_AUTH_TYPE=azure-ad # ⚠️ Untested / Not Production Ready
 # ... set auth vars ...
 uv run .
 ```
@@ -140,7 +141,7 @@ npx .
 export MCP_TRANSPORT=http
 export MCP_ALLOW_WRITE=true
 export MCP_CONFIRM_WRITE=true
-export FASTMCP_AUTH_TYPE=azure-ad
+export FASTMCP_AUTH_TYPE=azure-ad # ⚠️ Untested / Not Production Ready
 # ... set auth vars ...
 npx .
 ```
@@ -169,6 +170,11 @@ The server is configured entirely via environment variables.
 If `MCP_ALLOW_WRITE=true`, the server enforces the following additional security checks at startup:
 1. **Explicit Confirmation**: You must set `MCP_CONFIRM_WRITE=true`.
 2. **Mandatory Authentication (HTTP)**: If using `http` transport, you must configure `FASTMCP_AUTH_TYPE` (e.g., `azure-ad`, `oidc`, `jwt`). Write mode over unauthenticated HTTP is prohibited.
+
+> ⚠️ **Warning: Authentication Verification Pending**
+> **Token Auth** and **Azure AD Auth** have not been tested and are **not production-ready**.
+> While the implementation follows standard FastMCP patterns, end-to-end verification is pending.
+> See [Testing & Validation](#testing--validation) for current status.
 
 ### Authentication (Azure AD)
 To enable Azure AD authentication, set `FASTMCP_AUTH_TYPE=azure-ad`.
@@ -481,9 +487,9 @@ This project has been rigorously tested against **PostgreSQL 9.6** to ensure com
 - **Protocol**: SSE (HTTP/HTTPS), Stdio (All Passed)
 - **Database**: PostgreSQL 9.6 (All Tools Verified)
 - **Auth**: Token Auth, Azure AD Auth (To be verified)
-  > **Verification Status**: End-to-end verification for **Token Auth** and **Azure AD Auth** is currently pending setup of a dedicated Azure AD tenant. While the code implements standard FastMCP patterns, these specific providers have not been validated against a live identity provider.
-  > 
-  > **Limitation**: As noted in [Security Constraints](#security-constraints), **Write Mode** requires mandatory authentication when using HTTP. Until **Token Auth** or **Azure AD Auth** is verified, use `stdio` transport or ensure strict network isolation if testing Write Mode.
+   > **Verification Status**: **Token Auth** and **Azure AD Auth** have not been tested and are **not production-ready**. End-to-end verification is currently pending setup of a dedicated Azure AD tenant. While the code implements standard FastMCP patterns, these specific providers have not been validated against a live identity provider.
+   > 
+   > **Limitation**: As noted in [Security Constraints](#security-constraints), **Write Mode** requires mandatory authentication when using HTTP. Until **Token Auth** or **Azure AD Auth** is verified, use `stdio` transport or ensure strict network isolation if testing Write Mode.
   > 
   > **Timeline**: Verification is scheduled for the next minor release. Follow status in [Repository Issues](https://github.com/harryvaldez/mcp_cla_pg/issues).
 
