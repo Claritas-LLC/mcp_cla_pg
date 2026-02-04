@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sys
+import time
 import atexit
 import signal
 from datetime import timedelta
@@ -19,7 +20,7 @@ from psycopg.errors import UndefinedTable
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse, JSONResponse
+from starlette.responses import PlainTextResponse, JSONResponse, HTMLResponse
 
 # Configure structured logging
 log_level_str = os.environ.get("MCP_LOG_LEVEL", "INFO").upper()
@@ -2871,6 +2872,130 @@ def _configure_fastmcp_runtime() -> None:
         fastmcp.settings.check_for_updates = "off"
     except Exception:
         pass
+
+
+SESSION_MONITOR_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>DB Sessions Monitor</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        h1 { text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>PostgreSQL Sessions (Active vs Inactive)</h1>
+        <canvas id="sessionsChart"></canvas>
+    </div>
+    <script>
+        const ctx = document.getElementById('sessionsChart').getContext('2d');
+        const chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: 'Active',
+                        borderColor: 'rgb(75, 192, 192)',
+                        data: [],
+                        tension: 0.1,
+                        fill: false
+                    },
+                    {
+                        label: 'Inactive',
+                        borderColor: 'rgb(255, 99, 132)',
+                        data: [],
+                        tension: 0.1,
+                        fill: false
+                    }
+                ]
+            },
+            options: {
+                scales: {
+                    x: { title: { display: true, text: 'Time' } },
+                    y: { beginAtZero: true, title: { display: true, text: 'Count' } }
+                }
+            }
+        });
+
+        async function fetchData() {
+            try {
+                const response = await fetch('/api/sessions');
+                const data = await response.json();
+                const now = new Date().toLocaleTimeString();
+
+                if (chart.data.labels.length > 20) {
+                    chart.data.labels.shift();
+                    chart.data.datasets[0].data.shift();
+                    chart.data.datasets[1].data.shift();
+                }
+
+                chart.data.labels.push(now);
+                chart.data.datasets[0].data.push(data.active);
+                chart.data.datasets[1].data.push(data.inactive);
+                chart.update();
+            } catch (error) {
+                console.error('Error fetching data:', error);
+            }
+        }
+
+        // Fetch every 5 seconds
+        setInterval(fetchData, 5000);
+        fetchData(); // Initial fetch
+    </script>
+</body>
+</html>
+"""
+
+@mcp.custom_route("/sessions-monitor", methods=["GET"])
+async def sessions_monitor(_request: Request) -> HTMLResponse:
+    return HTMLResponse(SESSION_MONITOR_HTML)
+
+@mcp.custom_route("/api/sessions", methods=["GET"])
+async def api_sessions(_request: Request) -> JSONResponse:
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            # Query for session counts
+            # Active: state = 'active'
+            # Inactive: state != 'active' (includes idle, idle in transaction, etc.)
+            _execute_safe(
+                cur,
+                """
+                SELECT
+                    sum(case when state = 'active' then 1 else 0 end) as active,
+                    sum(case when state != 'active' then 1 else 0 end) as inactive
+                FROM pg_stat_activity
+                """
+            )
+            row = cur.fetchone()
+            active = row["active"] if row and row["active"] is not None else 0
+            inactive = row["inactive"] if row and row["inactive"] is not None else 0
+            
+            return JSONResponse({
+                "active": active,
+                "inactive": inactive,
+                "timestamp": time.time()
+            })
+
+@mcp.tool
+def db_pg96_monitor_sessions() -> str:
+    """
+    Get the link to the real-time database sessions monitor dashboard.
+    
+    Returns:
+        A message containing the URL to the sessions monitor dashboard.
+    """
+    port = os.environ.get("MCP_PORT", "8000")
+    host = os.environ.get("MCP_HOST", "localhost")
+    if host == "0.0.0.0":
+        host = "localhost"
+        
+    url = f"http://{host}:{port}/sessions-monitor"
+    return f"Monitor available at: {url}"
 
 
 def main() -> None:

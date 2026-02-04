@@ -404,6 +404,14 @@ The analysis of the `smsadmin` schema reveals a significant lack of structural e
 2.  **Create Foreign Keys:** Explicitly define relationships (e.g., `app_log.client_id` -> `client_master.client_id`).
 3.  **Standardize ID Types:** Migrate `double precision` and `numeric` IDs to `bigint` for consistency and performance.
 
+### 7. Real-time Session Monitor (MCP Apps)
+**Prompt:** `call db_pg96_monitor_sessions()`
+
+**Result:**
+"Monitor available at: http://localhost:8000/sessions-monitor"
+
+(Opens a dashboard with a live line graph of active vs. inactive sessions, refreshing every 5 seconds)
+
 
 ---
 

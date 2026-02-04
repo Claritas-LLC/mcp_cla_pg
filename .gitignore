@@ -7,6 +7,7 @@ env/
 venv/
 .env
 .venv
+fresh_env/
 *.log
 pg_settings.csv
 pg_settings.txt
