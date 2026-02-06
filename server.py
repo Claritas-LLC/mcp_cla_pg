@@ -13,7 +13,7 @@ import signal
 import decimal
 from datetime import datetime, date, timedelta
 from urllib.parse import quote, urlparse, urlunparse, urlsplit, urlunsplit
-from typing import Any
+from typing import Any, Optional
 
 from sshtunnel import SSHTunnelForwarder
 from fastmcp import FastMCP
@@ -24,6 +24,34 @@ from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, JSONResponse, HTMLResponse
+
+# Startup Confirmation Dialog
+# As requested: "once this MCP is loaded, it will load a dialog box asking the user's confirmation"
+if sys.platform == 'win32':
+    try:
+        import ctypes
+        def show_startup_confirmation():
+            # MessageBox constants
+            MB_YESNO = 0x04
+            MB_ICONQUESTION = 0x20
+            MB_TOPMOST = 0x40000
+            MB_SETFOREGROUND = 0x10000
+            IDYES = 6
+
+            result = ctypes.windll.user32.MessageBoxW(
+                0, 
+                "Do you want to run the MCP Postgres Server?", 
+                "MCP Server Confirmation", 
+                MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND
+            )
+            
+            if result != IDYES:
+                sys.exit(0)
+
+        show_startup_confirmation()
+    except Exception as e:
+        # If dialog fails, log it but proceed (or exit? safe to proceed if UI fails, but maybe log to stderr)
+        sys.stderr.write(f"Warning: Could not show startup confirmation dialog: {e}\n")
 
 # Configure structured logging
 log_level_str = os.environ.get("MCP_LOG_LEVEL", "INFO").upper()
@@ -2827,7 +2855,7 @@ def db_pg96_analyze_indexes(schema: str | None = None, limit: int = 50) -> dict[
 def db_pg96_analyze_logical_data_model(
     schema: str = "public",
     include_views: bool = False,
-    max_entities: int = 200,
+    max_entities: Optional[int] = None,
     include_attributes: bool = True
 ) -> dict[str, Any]:
     """
@@ -3497,6 +3525,7 @@ DATA_MODEL_HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Data Model Analysis</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/svg-pan-zoom@3.6.1/dist/svg-pan-zoom.min.js"></script>
     <script type="module">
         import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
         mermaid.initialize({ startOnLoad: false, theme: 'default', maxTextSize: 1000000 });
@@ -3607,15 +3636,41 @@ DATA_MODEL_HTML = """
         const urlParams = new URLSearchParams(window.location.search);
         const id = urlParams.get('id');
 
-        function renderMermaid(graphDefinition) {
+        async function renderMermaid(graphDefinition) {
             const element = document.getElementById('mermaidGraph');
             if (graphDefinition) {
                 element.textContent = graphDefinition;
                 element.removeAttribute('data-processed');
+                // Clean up previous instance
+                if (window.panZoomInstance) {
+                    window.panZoomInstance.destroy();
+                    window.panZoomInstance = null;
+                }
             }
-            window.mermaid.run({
+            
+            await window.mermaid.run({
                 nodes: [element]
             });
+
+            const svg = element.querySelector('svg');
+            if (svg) {
+                // Ensure SVG has explicit dimensions for pan-zoom to work correctly
+                svg.style.height = '600px'; 
+                svg.style.width = '100%';
+                
+                try {
+                    window.panZoomInstance = svgPanZoom(svg, {
+                        zoomEnabled: true,
+                        controlIconsEnabled: true,
+                        fit: true,
+                        center: true,
+                        minZoom: 0.1,
+                        maxZoom: 10
+                    });
+                } catch (e) {
+                    console.error("PanZoom initialization failed", e);
+                }
+            }
         }
 
         async function loadData() {
@@ -3633,6 +3688,74 @@ DATA_MODEL_HTML = """
             } catch (err) {
                 console.error(err);
                 document.body.innerHTML = `<div class="p-8 text-red-600 text-center font-bold">Error loading analysis: ${err.message}</div>`;
+            }
+        }
+
+        const ITEMS_PER_PAGE = 20;
+        let currentIssuesPage = 1;
+        let currentRecsPage = 1;
+        let allIssuesData = [];
+        let allRecsData = [];
+
+        function renderPaginatedList(containerId, items, page, type) {
+            const container = document.getElementById(containerId);
+            const start = (page - 1) * ITEMS_PER_PAGE;
+            const end = start + ITEMS_PER_PAGE;
+            const pageItems = items.slice(start, end);
+            const totalPages = Math.ceil(items.length / ITEMS_PER_PAGE);
+
+            if (items.length === 0) {
+                 if (type === 'issue') {
+                    container.innerHTML = '<div class="text-green-600 italic">No significant issues found. Great job!</div>';
+                 } else {
+                    container.innerHTML = '<div class="text-gray-500 italic">No specific recommendations at this time.</div>';
+                 }
+                 return;
+            }
+
+            const listHtml = pageItems.map(i => {
+                if (type === 'issue') {
+                    return `
+                    <div class="bg-white p-3 rounded border-l-4 border-red-500 shadow-sm text-sm">
+                        <div class="font-bold text-gray-800">${i.entity || 'General'}</div>
+                        <div class="text-gray-600">${i.issue}</div>
+                         ${i.details ? `<div class="text-xs text-gray-500 mt-1">${typeof i.details === 'string' ? i.details : JSON.stringify(i.details)}</div>` : ''}
+                    </div>`;
+                } else {
+                     return `
+                    <div class="bg-white p-3 rounded border-l-4 border-blue-500 shadow-sm text-sm">
+                        <div class="font-bold text-gray-800">${i.entity || 'General'}</div>
+                        <div class="text-gray-600">${i.recommendation}</div>
+                    </div>`;
+                }
+            }).join('');
+
+            const controlsHtml = totalPages > 1 ? `
+                <div class="flex justify-between items-center mt-4 text-sm">
+                    <button onclick="changePage('${type}', -1)" ${page === 1 ? 'disabled' : ''} class="px-3 py-1 bg-gray-200 rounded hover:bg-gray-300 disabled:opacity-50 disabled:cursor-not-allowed">Previous</button>
+                    <span>Page ${page} of ${totalPages} (${items.length} items)</span>
+                    <button onclick="changePage('${type}', 1)" ${page === totalPages ? 'disabled' : ''} class="px-3 py-1 bg-gray-200 rounded hover:bg-gray-300 disabled:opacity-50 disabled:cursor-not-allowed">Next</button>
+                </div>
+            ` : `<div class="mt-2 text-xs text-gray-500 text-right">Showing all ${items.length} items</div>`;
+
+            container.innerHTML = listHtml + controlsHtml;
+        }
+
+        window.changePage = function(type, delta) {
+            if (type === 'issue') {
+                const totalPages = Math.ceil(allIssuesData.length / ITEMS_PER_PAGE);
+                const newPage = currentIssuesPage + delta;
+                if (newPage >= 1 && newPage <= totalPages) {
+                    currentIssuesPage = newPage;
+                    renderPaginatedList('issuesList', allIssuesData, currentIssuesPage, 'issue');
+                }
+            } else if (type === 'rec') {
+                const totalPages = Math.ceil(allRecsData.length / ITEMS_PER_PAGE);
+                const newPage = currentRecsPage + delta;
+                if (newPage >= 1 && newPage <= totalPages) {
+                    currentRecsPage = newPage;
+                    renderPaginatedList('recommendationsList', allRecsData, currentRecsPage, 'rec');
+                }
             }
         }
 
@@ -3655,47 +3778,25 @@ DATA_MODEL_HTML = """
             const score = Math.max(0, 100 - (totalIssues * 2));
             document.getElementById('modelScore').textContent = score + '/100';
 
-            // Issues List
-            const issuesContainer = document.getElementById('issuesList');
-            const allIssues = [
+            // Issues List Initialization
+            allIssuesData = [
                 ...issues.entities, 
                 ...issues.identifiers, 
                 ...issues.normalization, 
                 ...issues.relationships, 
                 ...issues.attributes
             ];
-            
-            if (allIssues.length === 0) {
-                issuesContainer.innerHTML = '<div class="text-green-600 italic">No significant issues found. Great job!</div>';
-            } else {
-                issuesContainer.innerHTML = allIssues.slice(0, 10).map(i => `
-                    <div class="bg-white p-3 rounded border-l-4 border-red-500 shadow-sm text-sm">
-                        <div class="font-bold text-gray-800">${i.entity || 'General'}</div>
-                        <div class="text-gray-600">${i.issue}</div>
-                    </div>
-                `).join('') + (allIssues.length > 10 ? `<div class="text-center text-sm text-gray-500 mt-2">+ ${allIssues.length - 10} more issues</div>` : '');
-            }
+            renderPaginatedList('issuesList', allIssuesData, currentIssuesPage, 'issue');
 
-            // Recommendations List
-            const recsContainer = document.getElementById('recommendationsList');
-            const allRecs = [
+            // Recommendations List Initialization
+            allRecsData = [
                 ...recommendations.entities,
                 ...recommendations.identifiers,
                 ...recommendations.normalization,
                 ...recommendations.relationships,
                 ...recommendations.attributes
             ];
-
-            if (allRecs.length === 0) {
-                recsContainer.innerHTML = '<div class="text-gray-500 italic">No specific recommendations at this time.</div>';
-            } else {
-                recsContainer.innerHTML = allRecs.slice(0, 10).map(r => `
-                    <div class="bg-white p-3 rounded border-l-4 border-blue-500 shadow-sm text-sm">
-                        <div class="font-bold text-gray-800">${r.entity || 'General'}</div>
-                        <div class="text-gray-600">${r.recommendation}</div>
-                    </div>
-                `).join('') + (allRecs.length > 10 ? `<div class="text-center text-sm text-gray-500 mt-2">+ ${allRecs.length - 10} more recommendations</div>` : '');
-            }
+            renderPaginatedList('recommendationsList', allRecsData, currentRecsPage, 'rec');
 
             // Detailed Entity Table
             const entityTable = document.getElementById('entityTableBody');
