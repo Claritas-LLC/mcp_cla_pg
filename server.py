@@ -40,7 +40,7 @@ if sys.platform == 'win32':
 
             result = ctypes.windll.user32.MessageBoxW(
                 0, 
-                "Do you want to run the MCP Postgres Server?", 
+                "This MCP server is in Beta version.  Review all commands before running.  Do you want to proceed?", 
                 "MCP Server Confirmation", 
                 MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND
             )
