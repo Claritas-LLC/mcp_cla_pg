@@ -66,6 +66,7 @@ docker run -d \
   --name mcp-postgres-http \
   -e DATABASE_URL=postgresql://user:password@host.docker.internal:5432/dbname \
   -e MCP_TRANSPORT=http \
+  -e MCP_ALLOW_WRITE=false
   -p 8000:8000 \
   harryvaldez/mcp-postgres:latest
 
