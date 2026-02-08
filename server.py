@@ -4078,6 +4078,9 @@ async def api_sessions(_request: Request) -> JSONResponse:
                 "timestamp": time.time()
             })
 
+async def health_check(_request: Request) -> JSONResponse:
+    return JSONResponse({"status": "healthy"})
+
 @mcp.tool
 def db_pg96_monitor_sessions() -> str:
     """
@@ -4142,6 +4145,7 @@ def main() -> None:
                 
                 # Create a separate Starlette app for the UI to avoid conflict with mcp.run()
                 ui_routes = [
+                    Route("/health", health_check),
                     Route("/data-model-analysis", data_model_analysis_ui),
                     Route("/api/data-model/{result_id}", get_data_model_result),
                     Route("/sessions-monitor", sessions_monitor),
