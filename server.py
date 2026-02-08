@@ -291,7 +291,7 @@ class BrowserFriendlyMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 # Add the middleware to the FastMCP app
-mcp.app.add_middleware(BrowserFriendlyMiddleware)
+mcp.http_app().add_middleware(BrowserFriendlyMiddleware)
 
 
 def _build_database_url_from_pg_env() -> str | None:
@@ -4313,9 +4313,9 @@ def main() -> None:
                 
                 # Run the MCP's underlying web app directly with uvicorn
                 # This avoids calling mcp.run() twice, which can cause state conflicts.
-                # mcp.app contains all routes: MCP protocol (SSE) and custom UI.
+                # mcp.http_app() contains all routes: MCP protocol (SSE) and custom UI.
                 uvicorn.run(
-                    mcp.app,
+                    mcp.http_app(),
                     host=host,
                     port=port,
                     log_level="warning"
