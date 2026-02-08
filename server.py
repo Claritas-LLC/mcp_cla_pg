@@ -24,6 +24,7 @@ from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, JSONResponse, HTMLResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.applications import Starlette
 from starlette.routing import Route
 import uvicorn
@@ -210,6 +211,87 @@ mcp = FastMCP(
     name=os.environ.get("MCP_SERVER_NAME", "PostgreSQL MCP Server"),
     auth=_get_auth()
 )
+
+# Browser-friendly middleware to handle direct visits to the SSE endpoint
+class BrowserFriendlyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # If visiting the MCP endpoint with a browser (Accept: text/html)
+        # and NOT providing the required text/event-stream header
+        if request.url.path == "/mcp":
+            accept = request.headers.get("accept", "")
+            if "text/html" in accept and "text/event-stream" not in accept:
+                logger.info(f"Interposing browser-friendly response for {request.url.path}")
+                return HTMLResponse(f"""
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <title>PostgreSQL MCP Server</title>
+                        <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+                        <style>
+                            .bg-gradient {{ background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); }}
+                        </style>
+                    </head>
+                    <body class="bg-gray-50 min-h-screen flex items-center justify-center p-4">
+                        <div class="bg-white rounded-2xl shadow-2xl max-w-2xl w-full overflow-hidden">
+                            <div class="bg-gradient p-8 text-white">
+                                <h1 class="text-4xl font-extrabold mb-2">PostgreSQL MCP Server</h1>
+                                <p class="text-blue-100 text-lg opacity-90">Protocol Endpoint Detected</p>
+                            </div>
+                            
+                            <div class="p-8">
+                                <div class="flex items-start mb-6 bg-blue-50 p-4 rounded-xl border border-blue-100">
+                                    <div class="bg-blue-500 text-white rounded-full p-2 mr-4 mt-1">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="id-circle" />
+                                            <circle cx="12" cy="12" r="9" />
+                                            <line x1="12" y1="8" x2="12" y2="12" />
+                                            <line x1="12" y1="16" x2="12.01" y2="16" />
+                                        </svg>
+                                    </div>
+                                    <div>
+                                        <h3 class="text-blue-800 font-bold text-lg mb-1">MCP Protocol Active</h3>
+                                        <p class="text-blue-700">
+                                            This endpoint (<code class="bg-blue-100 px-1 rounded">/mcp</code>) is reserved for <strong>Model Context Protocol</strong> clients.
+                                        </p>
+                                    </div>
+                                </div>
+
+                                <p class="text-gray-600 mb-8 leading-relaxed">
+                                    You are seeing this page because your browser cannot speak the <code>text/event-stream</code> protocol required for MCP. 
+                                    To use this server, add this URL to your MCP client configuration (e.g., Claude Desktop).
+                                </p>
+
+                                <div class="space-y-4">
+                                    <h4 class="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-2">Available Dashboards</h4>
+                                    
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <a href="/data-model-analysis" class="group flex flex-col p-5 border border-gray-100 rounded-xl hover:border-blue-300 hover:shadow-md transition-all bg-white">
+                                            <span class="text-blue-600 font-bold mb-1 group-hover:text-blue-700">Data Model Analysis</span>
+                                            <span class="text-sm text-gray-500">View interactive ERD and schema health score.</span>
+                                        </a>
+                                        
+                                        <a href="/sessions-monitor" class="group flex flex-col p-5 border border-gray-100 rounded-xl hover:border-blue-300 hover:shadow-md transition-all bg-white">
+                                            <span class="text-blue-600 font-bold mb-1 group-hover:text-blue-700">Sessions Monitor</span>
+                                            <span class="text-sm text-gray-500">Track real-time database connections and queries.</span>
+                                        </a>
+                                    </div>
+                                </div>
+
+                                <div class="mt-10 pt-6 border-t border-gray-100 flex justify-between items-center">
+                                    <a href="/health" class="text-sm text-gray-400 hover:text-gray-600 transition-colors italic">Server Status: Healthy</a>
+                                    <a href="/" class="bg-gray-900 text-white px-6 py-2 rounded-lg font-medium hover:bg-black transition-colors shadow-sm">
+                                        View Server Info
+                                    </a>
+                                </div>
+                            </div>
+                        </div>
+                    </body>
+                    </html>
+                """)
+        return await call_next(request)
+
+# Add the middleware to the FastMCP app
+mcp.app.add_middleware(BrowserFriendlyMiddleware)
 
 
 def _build_database_url_from_pg_env() -> str | None:
@@ -514,16 +596,102 @@ async def health(_request: Request) -> PlainTextResponse:
 
 
 @mcp.custom_route("/", methods=["GET"])
-async def root(_request: Request) -> JSONResponse:
-    return JSONResponse({
-        "status": "online",
-        "message": "PostgreSQL MCP Server is running",
-        "endpoints": {
-            "mcp": "/mcp (MCP/SSE protocol endpoint)",
-            "health": "/health",
-            "info": "use 'db_pg96_server_info' tool via MCP"
-        }
-    })
+async def root(_request: Request) -> HTMLResponse:
+    return HTMLResponse(f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>PostgreSQL MCP Server</title>
+            <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+            <style>
+                .bg-gradient {{ background: linear-gradient(135deg, #111827 0%, #1f2937 100%); }}
+            </style>
+        </head>
+        <body class="bg-gray-50 min-h-screen font-sans">
+            <nav class="bg-gradient text-white p-6 shadow-lg">
+                <div class="max-w-5xl mx-auto flex justify-between items-center">
+                    <h1 class="text-2xl font-bold tracking-tight">PostgreSQL MCP Server</h1>
+                    <span class="bg-green-500 text-white text-xs font-bold px-3 py-1 rounded-full uppercase tracking-widest">Online</span>
+                </div>
+            </nav>
+
+            <main class="max-w-5xl mx-auto p-8">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-8 mb-12">
+                    <div class="md:col-span-2">
+                        <h2 class="text-3xl font-extrabold text-gray-900 mb-4">Server Status & Info</h2>
+                        <p class="text-lg text-gray-600 mb-6">
+                            This server provides a high-performance <strong>Model Context Protocol (MCP)</strong> interface to your PostgreSQL database.
+                        </p>
+                        
+                        <div class="bg-white p-6 rounded-2xl border border-gray-100 shadow-sm mb-8">
+                            <h3 class="text-sm font-bold text-gray-400 uppercase tracking-widest mb-4">Connection Details</h3>
+                            <dl class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-6">
+                                <div>
+                                    <dt class="text-sm text-gray-500">MCP Protocol Endpoint</dt>
+                                    <dd class="text-gray-900 font-mono text-sm bg-gray-50 p-2 rounded mt-1 border border-gray-100">/mcp</dd>
+                                </div>
+                                <div>
+                                    <dt class="text-sm text-gray-500">Health Check</dt>
+                                    <dd class="text-gray-900 font-mono text-sm bg-gray-50 p-2 rounded mt-1 border border-gray-100">/health</dd>
+                                </div>
+                                <div>
+                                    <dt class="text-sm text-gray-500">Database Host</dt>
+                                    <dd class="text-gray-900 font-medium mt-1">{ORIGINAL_DB_HOST or "N/A"}</dd>
+                                </div>
+                                <div>
+                                    <dt class="text-sm text-gray-500">Database Name</dt>
+                                    <dd class="text-gray-900 font-medium mt-1">{ORIGINAL_DB_NAME or "N/A"}</dd>
+                                </div>
+                            </dl>
+                        </div>
+                    </div>
+
+                    <div class="space-y-6">
+                        <div class="bg-blue-600 p-6 rounded-2xl text-white shadow-xl">
+                            <h3 class="font-bold text-xl mb-3 text-white">Interactive Tools</h3>
+                            <p class="text-blue-100 text-sm mb-6 opacity-90">Access your database insights through these specialized dashboards.</p>
+                            
+                            <div class="space-y-3">
+                                <a href="/data-model-analysis" class="block w-full text-center bg-white text-blue-700 font-bold py-3 rounded-xl hover:bg-blue-50 transition-colors">
+                                    Data Model Analysis
+                                </a>
+                                <a href="/sessions-monitor" class="block w-full text-center bg-blue-500 text-white border border-blue-400 font-bold py-3 rounded-xl hover:bg-blue-400 transition-colors">
+                                    Sessions Monitor
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-yellow-50 border-l-4 border-yellow-400 p-6 rounded-r-2xl mb-12">
+                    <div class="flex">
+                        <div class="flex-shrink-0">
+                            <svg class="h-6 w-6 text-yellow-400" viewBox="0 0 20 20" fill="currentColor">
+                                <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd" />
+                            </svg>
+                        </div>
+                        <div class="ml-3">
+                            <h3 class="text-sm font-bold text-yellow-800 uppercase tracking-wider">How to connect</h3>
+                            <div class="mt-2 text-sm text-yellow-700">
+                                <p>To use this server with Claude Desktop, add the following to your configuration:</p>
+                                <pre class="mt-2 p-3 bg-white bg-opacity-50 rounded font-mono text-xs overflow-x-auto">"mcpServers": {{
+    "postgres": {{
+        "command": "docker",
+        "args": ["run", "-i", "--rm", "-e", "DATABASE_URL=...", "harryvaldez/mcp-postgres:latest"]
+    }}
+}}</pre>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+
+            <footer class="max-w-5xl mx-auto p-8 border-t border-gray-100 text-center text-gray-400 text-sm">
+                &copy; {datetime.now().year} MCP PostgreSQL Server &bull; Running on FastMCP
+            </footer>
+        </body>
+        </html>
+    """)
 
 
 @mcp.tool
