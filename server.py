@@ -4143,14 +4143,14 @@ def main() -> None:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 
-                # Run the full MCP server in the background.
-                # 'http' transport supports both regular HTTP requests (for UI) and SSE.
-                mcp.run(
-                    transport="http",
+                # Run the MCP's underlying web app directly with uvicorn
+                # This avoids calling mcp.run() twice, which can cause state conflicts.
+                # mcp.app contains all routes: MCP protocol (SSE) and custom UI.
+                uvicorn.run(
+                    mcp.app,
                     host=host,
                     port=port,
-                    show_banner=False,
-                    log_level="warning" # Use warning to suppress info-level noise
+                    log_level="warning"
                 )
             except Exception as e:
                 logger.error(f"Background HTTP server failed: {e}")
