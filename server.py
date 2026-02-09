@@ -284,32 +284,39 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-# Initialize FastMCP with optional API Key support
+# Initialize FastMCP
 auth_type = os.environ.get("FASTMCP_AUTH_TYPE", "").lower()
-mcp_kwargs = {
-    "name": os.environ.get("MCP_SERVER_NAME", "PostgreSQL MCP Server"),
-}
+mcp = FastMCP(
+    name=os.environ.get("MCP_SERVER_NAME", "PostgreSQL MCP Server"),
+    auth=_get_auth() if auth_type != "apikey" else None
+)
 
-if auth_type == "apikey":
-    from fastapi import Depends, HTTPException, Security
-    from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-    
-    security = HTTPBearer()
-    
-    async def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)):
-        expected_key = os.environ.get("FASTMCP_API_KEY")
-        if not expected_key:
-            logger.error("FASTMCP_API_KEY not configured but auth type is apikey")
-            raise HTTPException(status_code=500, detail="Server configuration error")
+# API Key Middleware for simple static token auth
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Only enforce for the MCP protocol endpoint
+        # FastMCP typically uses /mcp or the root for SSE
+        if request.url.path == "/mcp":
+            auth_type = os.environ.get("FASTMCP_AUTH_TYPE", "").lower()
+            if auth_type == "apikey":
+                auth_header = request.headers.get("Authorization")
+                expected_key = os.environ.get("FASTMCP_API_KEY")
+                
+                if not expected_key:
+                    logger.error("FASTMCP_API_KEY not configured but auth type is apikey")
+                    return JSONResponse({"detail": "Server configuration error"}, status_code=500)
+                
+                if not auth_header or not auth_header.startswith("Bearer "):
+                    return JSONResponse({"detail": "Missing or invalid Authorization header"}, status_code=401)
+                
+                try:
+                    token = auth_header.split(" ")[1]
+                    if token != expected_key:
+                        return JSONResponse({"detail": "Invalid API Key"}, status_code=403)
+                except IndexError:
+                    return JSONResponse({"detail": "Invalid Authorization header format"}, status_code=401)
         
-        if credentials.credentials != expected_key:
-            raise HTTPException(status_code=403, detail="Invalid API Key")
-            
-    mcp_kwargs["dependencies"] = [Depends(verify_api_key)]
-else:
-    mcp_kwargs["auth"] = _get_auth()
-
-mcp = FastMCP(**mcp_kwargs)
+        return await call_next(request)
 
 # Browser-friendly middleware to handle direct visits to the SSE endpoint
 class BrowserFriendlyMiddleware(BaseHTTPMiddleware):
@@ -390,6 +397,7 @@ class BrowserFriendlyMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 # Add the middleware to the FastMCP app
+mcp.http_app().add_middleware(APIKeyMiddleware)
 mcp.http_app().add_middleware(BrowserFriendlyMiddleware)
 
 
