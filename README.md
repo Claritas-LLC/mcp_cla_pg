@@ -274,6 +274,22 @@ Set `FASTMCP_AUTH_TYPE=apikey`.
 |----------|-------------|
 | `FASTMCP_API_KEY` | The secret key clients must provide in the `Authorization: Bearer <key>` header. |
 
+#### 7. n8n Integration (AI Agent & HTTP Request)
+The server is fully compatible with n8n workflows.
+
+**Using the MCP Client Tool (AI Agent):**
+1. Run the server with `FASTMCP_AUTH_TYPE=apikey`.
+2. In n8n, add an **AI Agent** node.
+3. Add the **MCP Tool** to the agent.
+4. Set **Source** to `Remote (SSE)`.
+5. Set **URL** to `http://<your-ip>:8000/mcp`.
+6. Add a header: `Authorization: Bearer <your-api-key>`.
+
+**Using the HTTP Request Node:**
+1. Run the server with `FASTMCP_AUTH_TYPE=github` (or another OAuth2 provider).
+2. Create an **OAuth2 API** credential in n8n.
+3. Use the **HTTP Request** node with that credential to call tools via JSON-RPC.
+
 ### HTTPS / SSL
 To enable HTTPS, provide both the certificate and key files.
 

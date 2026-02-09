@@ -114,14 +114,15 @@ We provide a CloudFormation template (`deploy/aws-ecs.yaml`) for deploying to AW
 
 When deploying to production, verify the following:
 
-1.  **Authentication**: If using HTTP transport, enable Azure AD or another auth provider.
-    *   Set `FASTMCP_AUTH_TYPE=azure-ad`.
-    *   Configure Tenant/Client IDs.
-2.  **Network**: Ensure the container can reach your PostgreSQL database.
-    *   **Azure**: Use VNet injection if using Azure Database for PostgreSQL.
-    *   **AWS**: Ensure Security Groups allow inbound port 5432 from the ECS tasks.
-3.  **Secrets**: Never hardcode passwords. Use Azure Key Vault or AWS Secrets Manager where possible (templates currently use environment variables/secrets).
-4.  **Write Access**: Keep `MCP_ALLOW_WRITE=false` unless explicitly required for maintenance tasks.
+1. **Authentication**: If using HTTP transport, enable an auth provider (Azure AD, GitHub, Google, or API Key).
+   * Set `FASTMCP_AUTH_TYPE` to your preferred mode.
+   * For machine-to-machine (e.g., n8n), use `apikey` with `FASTMCP_API_KEY`.
+   * For human-in-the-loop, use `github`, `google`, or `azure-ad`.
+2. **Network**: Ensure the container can reach your PostgreSQL database.
+   * **Azure**: Use VNet injection if using Azure Database for PostgreSQL.
+   * **AWS**: Ensure Security Groups allow inbound port 5432 from the ECS tasks.
+3. **Secrets**: Never hardcode passwords. Use Azure Key Vault or AWS Secrets Manager where possible (templates currently use environment variables/secrets).
+4. **Write Access**: Keep `MCP_ALLOW_WRITE=false` unless explicitly required for maintenance tasks.
 
 ---
 
@@ -134,10 +135,11 @@ Key environment variables supported by the server:
 - `MCP_PORT` Port for HTTP transport, default `8000`.
 - `MCP_ALLOW_WRITE` Allow write operations, default `false`.
 - `MCP_CONFIRM_WRITE` Require confirmation for writes, default `false`.
-- `FASTMCP_AUTH_TYPE` Authentication type (e.g., `azure-ad`).
-- `FASTMCP_OIDC_CONFIG_URL` OIDC configuration URL when using Azure AD or other OIDC.
-- `FASTMCP_OIDC_CLIENT_ID` OIDC client ID.
-- `FASTMCP_OIDC_CLIENT_SECRET` OIDC client secret.
+- `FASTMCP_AUTH_TYPE` Authentication type (`apikey`, `github`, `google`, `azure-ad`, `oidc`, `jwt`).
+- `FASTMCP_API_KEY` Secret key for `apikey` auth.
+- `FASTMCP_GITHUB_CLIENT_ID` / `FASTMCP_GITHUB_CLIENT_SECRET` GitHub OAuth credentials.
+- `FASTMCP_GOOGLE_CLIENT_ID` / `FASTMCP_GOOGLE_CLIENT_SECRET` Google OAuth credentials.
+- `FASTMCP_AZURE_AD_TENANT_ID` / `FASTMCP_AZURE_AD_CLIENT_ID` Azure AD credentials.
 - `MCP_SSL_CERT` Path to TLS certificate for HTTPS.
 - `MCP_SSL_KEY` Path to TLS private key for HTTPS.
 
