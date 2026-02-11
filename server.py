@@ -303,7 +303,8 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
         # 1. Compatibility Redirect: Redirect /mcp to /sse
         # Many users might try /mcp based on old docs or assumptions
-        if path == "/mcp":
+        # Only redirect GET requests; POST requests might be for stateless JSON-RPC
+        if path == "/mcp" and request.method == "GET":
             return RedirectResponse(url="/sse")
 
         # 2. Enforce API Key on SSE and Message endpoints

@@ -1,7 +1,7 @@
 services:
   mcp-postgres:
-    image: harryvaldez/mcp-postgres:latest
-    # build: .
+    build: .
+    # image: harryvaldez/mcp-postgres:latest
     ports:
       - "8000:8000"
     environment:
