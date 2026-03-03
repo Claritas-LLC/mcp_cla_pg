@@ -7,8 +7,8 @@ This server exposes a suite of DBA-grade tools to inspect schemas, analyze perfo
 ## 📌 Current Release
 
 - Git tag: `v1.0.2`
-- Docker tags: `harryvaldez/mcp-postgres:latest`, `harryvaldez/mcp-postgres:v1.0.2`, `harryvaldez/mcp-postgres:6c8edcd`
-- Image digest: `sha256:53dc2f9a9f3e93e008d43c22f32f0823990c079bcf5a98ab77b6ae0feaa93dc7`
+- Docker tags: `harryvaldez/mcp-postgres:latest`, `harryvaldez/mcp-postgres:v1.0.2`, `harryvaldez/mcp-postgres:c7eefae`
+- Image digest: `sha256:f5a0b81f1639144dec0f9a38a4c86d3ce04cd4aeabf289bffefba46a3fa6a8e2`
 
 ### v1.0.2 Release Notes
 
