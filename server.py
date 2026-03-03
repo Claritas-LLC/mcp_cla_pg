@@ -136,7 +136,7 @@ def _get_auth() -> Any:
 
     # Full OIDC Proxy (handles login flow)
     if auth_type_lower == "oidc":
-        OIDCProxy = _import_symbol("fastmcp.auth.providers.oidc", "OIDCProxy")
+        OIDCProxy = _import_symbol("fastmcp.server.auth.oidc_proxy", "OIDCProxy")
 
         config_url = os.environ.get("FASTMCP_OIDC_CONFIG_URL")
         client_id = os.environ.get("FASTMCP_OIDC_CLIENT_ID")
@@ -159,7 +159,7 @@ def _get_auth() -> Any:
 
     # Pure JWT Verification (resource server mode)
     if auth_type_lower == "jwt":
-        JWTVerifier = _import_symbol("fastmcp.auth.providers.jwt", "JWTVerifier")
+        JWTVerifier = _import_symbol("fastmcp.server.auth.providers.jwt", "JWTVerifier")
 
         jwks_uri = os.environ.get("FASTMCP_JWT_JWKS_URI")
         issuer = os.environ.get("FASTMCP_JWT_ISSUER")
@@ -193,7 +193,7 @@ def _get_auth() -> Any:
         config_url = f"https://login.microsoftonline.com/{tenant_id}/v2.0/.well-known/openid-configuration"
         
         if client_secret and base_url:
-            OIDCProxy = _import_symbol("fastmcp.auth.providers.oidc", "OIDCProxy")
+            OIDCProxy = _import_symbol("fastmcp.server.auth.oidc_proxy", "OIDCProxy")
             return OIDCProxy(
                 config_url=config_url,
                 client_id=client_id,
@@ -202,7 +202,7 @@ def _get_auth() -> Any:
                 audience=os.environ.get("FASTMCP_AZURE_AD_AUDIENCE", client_id),
             )
         else:
-            JWTVerifier = _import_symbol("fastmcp.auth.providers.jwt", "JWTVerifier")
+            JWTVerifier = _import_symbol("fastmcp.server.auth.providers.jwt", "JWTVerifier")
             jwks_uri = f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys"
             issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
             return JWTVerifier(
@@ -213,7 +213,7 @@ def _get_auth() -> Any:
             
     # GitHub OAuth2
     if auth_type_lower == "github":
-        GitHubProvider = _import_symbol("fastmcp.auth.providers.github", "GitHubProvider")
+        GitHubProvider = _import_symbol("fastmcp.server.auth.providers.github", "GitHubProvider")
         
         client_id = os.environ.get("FASTMCP_GITHUB_CLIENT_ID")
         client_secret = os.environ.get("FASTMCP_GITHUB_CLIENT_SECRET")
@@ -233,7 +233,7 @@ def _get_auth() -> Any:
 
     # Google OAuth2
     if auth_type_lower == "google":
-        GoogleProvider = _import_symbol("fastmcp.auth.providers.google", "GoogleProvider")
+        GoogleProvider = _import_symbol("fastmcp.server.auth.providers.google", "GoogleProvider")
         
         client_id = os.environ.get("FASTMCP_GOOGLE_CLIENT_ID")
         client_secret = os.environ.get("FASTMCP_GOOGLE_CLIENT_SECRET")
@@ -253,8 +253,8 @@ def _get_auth() -> Any:
 
     # Generic OAuth2 Proxy
     if auth_type_lower == "oauth2":
-        OAuthProxy = _import_symbol("fastmcp.auth", "OAuthProxy")
-        JWTVerifier = _import_symbol("fastmcp.auth.providers.jwt", "JWTVerifier")
+        OAuthProxy = _import_symbol("fastmcp.server.auth.oauth_proxy", "OAuthProxy")
+        JWTVerifier = _import_symbol("fastmcp.server.auth.providers.jwt", "JWTVerifier")
         
         auth_url = os.environ.get("FASTMCP_OAUTH_AUTHORIZE_URL")
         token_url = os.environ.get("FASTMCP_OAUTH_TOKEN_URL")
@@ -2615,7 +2615,7 @@ def db_pg96_database_security_performance_metrics(
     """
     Alias for db_pg96_db_sec_perf_metrics to support clients expecting full-name tool convention.
     """
-    return db_pg96_db_sec_perf_metrics.fn(
+    return db_pg96_db_sec_perf_metrics(
         cache_hit_threshold=cache_hit_threshold,
         connection_usage_threshold=connection_usage_threshold,
         profile=profile,

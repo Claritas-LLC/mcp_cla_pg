@@ -30,6 +30,12 @@ This server exposes a suite of DBA-grade tools to inspect schemas, analyze perfo
 - **Python 3.13**: Built on the latest Python runtime for improved performance and security.
 - **Broad Compatibility**: Fully tested with **PostgreSQL 9.6+**. (Note: PostgreSQL 9.6 reached EOL in Nov 2021; we recommend using supported releases, e.g., PostgreSQL 12+, for production.)
 
+### FastMCP Compatibility (v3)
+
+- This server targets **FastMCP v3** (`>=3.0.0,<4`).
+- Decorated exports such as `db_pg96_*` are regular callables in FastMCP v3. If you are writing tests or scripts, call functions directly (for example, `db_pg96_ping()`), rather than expecting wrapper attributes like `.fn` on decorated results.
+- For auth provider extensions, use FastMCP v3 module paths under `fastmcp.server.auth...`.
+
 ---
 
 ## 🧾 LLM Calling Cheat Sheet

@@ -71,6 +71,8 @@ def db_pool(mocker, docker_up_down):
     else:
         server_module = importlib.import_module("server")
 
+    original_pool = getattr(server_module, "pool", None)
+
     # Wait for the database to be ready
     deadline = time.time() + 60
     while time.time() < deadline:
@@ -92,7 +94,18 @@ def db_pool(mocker, docker_up_down):
         kwargs={"row_factory": dict_row},
     )
     mocker.patch('server.pool', test_pool)
-    return test_pool
+    try:
+        yield test_pool
+    finally:
+        try:
+            test_pool.close()
+        except Exception:
+            pass
+        if original_pool is not None and original_pool is not test_pool:
+            try:
+                original_pool.close()
+            except Exception:
+                pass
 
 
 def test_functional_suite(db_pool):

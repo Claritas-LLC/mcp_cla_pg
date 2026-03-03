@@ -15,9 +15,7 @@ def test_run_query_logging(mocker, monkeypatch):
         server = importlib.import_module("server")
 
         try:
-            tool_obj = server.db_pg96_run_query
-            func = getattr(tool_obj, "fn", getattr(tool_obj, "func", None))
-            assert func is not None, "Could not find underlying function on Tool object."
+            func = server.db_pg96_run_query
 
             mock_info = mocker.patch.object(server.logger, "info")
             mock_debug = mocker.patch.object(server.logger, "debug")

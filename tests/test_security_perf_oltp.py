@@ -69,13 +69,13 @@ def test_security_perf_oltp(mocker):
         ],
     }
     mocker.patch.object(
-        server_module.db_pg96_db_sec_perf_metrics,
-        "fn",
+        server_module,
+        "db_pg96_db_sec_perf_metrics",
         return_value=mock_results,
     )
 
     # 2. Call the tool
-    results = server_module.db_pg96_database_security_performance_metrics.fn(profile="oltp")
+    results = server_module.db_pg96_database_security_performance_metrics(profile="oltp")
     assert results == mock_results
 
     # 3. Analyze results and assert conditions
