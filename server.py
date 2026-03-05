@@ -12,7 +12,7 @@ import threading
 import atexit
 import signal
 import decimal
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from urllib.parse import quote, urlparse, urlunparse, urlsplit, urlunsplit
 from typing import Any, Optional, cast
 
@@ -522,6 +522,17 @@ POOL_MAX_SIZE = _env_int("MCP_POOL_MAX_SIZE", 20)
 POOL_TIMEOUT = float(os.environ.get("MCP_POOL_TIMEOUT", "60.0"))
 POOL_MAX_WAITING = _env_int("MCP_POOL_MAX_WAITING", 20)
 STATEMENT_TIMEOUT_MS = _env_int("MCP_STATEMENT_TIMEOUT_MS", 120000) # 120s default
+RATE_LIMIT_ENABLED = _env_bool("MCP_RATE_LIMIT_ENABLED", True)
+RATE_LIMIT_PER_MINUTE = _env_int("MCP_RATE_LIMIT_PER_MINUTE", 600)
+BREAKER_TRIP_REJECTIONS = _env_int("MCP_BREAKER_TRIP_REJECTIONS", 20)
+BREAKER_OPEN_SECONDS = float(os.environ.get("MCP_BREAKER_OPEN_SECONDS", "30"))
+
+ENFORCE_TABLE_SCOPE = _env_bool("MCP_ENFORCE_TABLE_SCOPE", False)
+ALLOWED_TABLES_RAW = os.environ.get("MCP_ALLOWED_TABLES", "")
+
+AUDIT_LOG_FILE = os.environ.get("MCP_AUDIT_LOG_FILE", "mcp_audit.log")
+AUDIT_LOG_SQL_TEXT = _env_bool("MCP_AUDIT_LOG_SQL_TEXT", False)
+AUDIT_REQUIRE_PROMPT = _env_bool("MCP_AUDIT_REQUIRE_PROMPT", False)
 
 
 # SSH Tunnel Configuration
@@ -626,6 +637,179 @@ pool = ConnectionPool(
     open=True,
     kwargs={"row_factory": dict_row, "options": "-c DateStyle=ISO,MDY"},
 )
+
+
+def _parse_allowed_tables(raw_value: str) -> set[str]:
+    items = [item.strip().lower() for item in raw_value.split(",") if item.strip()]
+    malformed = [item for item in items if "." not in item]
+    if malformed:
+        raise RuntimeError(
+            "Invalid MCP_ALLOWED_TABLES entries (must be schema.table): "
+            + ", ".join(malformed[:10])
+        )
+    return set(items)
+
+
+def _validate_table_scope() -> None:
+    if not ENFORCE_TABLE_SCOPE:
+        return
+
+    allowed_tables = _parse_allowed_tables(ALLOWED_TABLES_RAW)
+    if not allowed_tables:
+        raise RuntimeError(
+            "MCP_ENFORCE_TABLE_SCOPE=true requires MCP_ALLOWED_TABLES (comma-separated schema.table list)."
+        )
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                  n.nspname as schema_name,
+                  c.relname as table_name,
+                  has_table_privilege(current_user, c.oid, 'SELECT') as can_select,
+                  has_table_privilege(current_user, c.oid, 'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') as can_write
+                from pg_class c
+                join pg_namespace n on n.oid = c.relnamespace
+                where c.relkind in ('r', 'p', 'v', 'm', 'f')
+                  and n.nspname not in ('pg_catalog', 'information_schema')
+                order by n.nspname, c.relname
+                """
+            )
+            rows = cur.fetchall()
+
+    selectable = {
+        f"{row['schema_name']}.{row['table_name']}".lower()
+        for row in rows
+        if row.get("can_select")
+    }
+    writable = {
+        f"{row['schema_name']}.{row['table_name']}".lower()
+        for row in rows
+        if row.get("can_write")
+    }
+
+    unauthorized_select = sorted(selectable - allowed_tables)
+    missing_select = sorted(allowed_tables - selectable)
+
+    if unauthorized_select:
+        raise RuntimeError(
+            "Credential scope violation: DB user can SELECT outside MCP_ALLOWED_TABLES. "
+            f"Examples: {', '.join(unauthorized_select[:10])}"
+        )
+
+    if missing_select:
+        raise RuntimeError(
+            "Credential scope violation: DB user is missing SELECT on allowed tables. "
+            f"Examples: {', '.join(missing_select[:10])}"
+        )
+
+    if not ALLOW_WRITE and writable:
+        raise RuntimeError(
+            "Credential scope violation: read-only MCP has write-capable DB credentials. "
+            f"Examples: {', '.join(sorted(writable)[:10])}"
+        )
+
+    logger.info(
+        f"Credential scope verified. allowed_tables={len(allowed_tables)} selectable={len(selectable)}"
+    )
+
+
+_validate_table_scope()
+
+
+class _QueryRateCircuitBreaker:
+    def __init__(self, rate_per_minute: int, trip_rejections: int, open_seconds: float):
+        self.rate_per_minute = max(1, rate_per_minute)
+        self.trip_rejections = max(1, trip_rejections)
+        self.open_seconds = max(1.0, open_seconds)
+        self.capacity = float(self.rate_per_minute)
+        self.tokens = float(self.rate_per_minute)
+        self.refill_per_second = self.rate_per_minute / 60.0
+        self.last_refill = time.monotonic()
+        self.open_until = 0.0
+        self.rejections = 0
+        self.lock = threading.Lock()
+
+    def acquire(self) -> None:
+        now = time.monotonic()
+        with self.lock:
+            if now < self.open_until:
+                remaining = max(1, int(self.open_until - now))
+                raise RuntimeError(
+                    f"Circuit breaker open due to excessive query volume. Retry in ~{remaining}s."
+                )
+
+            elapsed = max(0.0, now - self.last_refill)
+            self.last_refill = now
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_per_second)
+
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                self.rejections = 0
+                return
+
+            self.rejections += 1
+            if self.rejections >= self.trip_rejections:
+                self.open_until = now + self.open_seconds
+                self.rejections = 0
+                logger.error(
+                    "Opening query circuit breaker: query rate exceeded threshold. "
+                    f"open_seconds={self.open_seconds} rate_per_minute={self.rate_per_minute}"
+                )
+                raise RuntimeError(
+                    f"Rate limit exceeded. Circuit breaker opened for {int(self.open_seconds)} seconds."
+                )
+
+            raise RuntimeError(
+                f"Rate limit exceeded ({self.rate_per_minute}/minute). Throttling query execution."
+            )
+
+
+_query_circuit_breaker = (
+    _QueryRateCircuitBreaker(RATE_LIMIT_PER_MINUTE, BREAKER_TRIP_REJECTIONS, BREAKER_OPEN_SECONDS)
+    if RATE_LIMIT_ENABLED
+    else None
+)
+
+
+def _enforce_query_rate_limit() -> None:
+    if _query_circuit_breaker is None:
+        return
+    _query_circuit_breaker.acquire()
+
+
+_audit_log_lock = threading.Lock()
+
+
+def _write_audit_event(
+    *,
+    tool_name: str,
+    sql_text: str,
+    source_prompt: str | None,
+    params_json: str | None = None,
+) -> None:
+    if AUDIT_REQUIRE_PROMPT and not source_prompt:
+        raise ValueError(
+            "Audit policy requires source_prompt for query tools. Provide source_prompt or set MCP_AUDIT_REQUIRE_PROMPT=false."
+        )
+
+    event: dict[str, Any] = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "event_type": "query_audit",
+        "tool": tool_name,
+        "sql_len": len(sql_text),
+        "sql_sha256": hashlib.sha256(sql_text.encode("utf-8")).hexdigest(),
+        "source_prompt": source_prompt,
+        "source_prompt_sha256": hashlib.sha256(source_prompt.encode("utf-8")).hexdigest() if source_prompt else None,
+        "params_sha256": hashlib.sha256(params_json.encode("utf-8")).hexdigest() if params_json else None,
+    }
+    if AUDIT_LOG_SQL_TEXT:
+        event["sql"] = sql_text
+
+    with _audit_log_lock:
+        with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
 _SINGLE_QUOTED = re.compile(r"'(?:''|[^'])*'")
@@ -748,6 +932,7 @@ def _rollback_cursor_connection(cur) -> None:
 def _execute_safe(cur, sql: Any, params: Any = None) -> None:
     """Executes a query with session-level timeouts and sanitized error handling."""
     try:
+        _enforce_query_rate_limit()
         if logger.isEnabledFor(logging.DEBUG):
             # Log query (truncated if too long for sanity)
             query_str = str(sql)
@@ -4104,7 +4289,12 @@ def db_pg96_describe_table(schema: str, table: str) -> dict[str, Any]:
 
 
 @mcp.tool
-def db_pg96_run_query(sql: str, params_json: str | None = None, max_rows: int | None = None) -> dict[str, Any]:
+def db_pg96_run_query(
+    sql: str,
+    params_json: str | None = None,
+    max_rows: int | None = None,
+    source_prompt: str | None = None,
+) -> dict[str, Any]:
     """
     Execute a read-only SQL query against the database.
 
@@ -4131,6 +4321,12 @@ def db_pg96_run_query(sql: str, params_json: str | None = None, max_rows: int | 
     )
     logger.info(f"run_query called. sql_len={len(sql)} max_rows={limit} sql_sha256={sql_fingerprint}")
     logger.debug(f"run_query params_sha256={params_fingerprint}")
+    _write_audit_event(
+        tool_name="db_pg96_run_query",
+        sql_text=sql,
+        source_prompt=source_prompt,
+        params_json=params_json,
+    )
     params: dict[str, Any] | None = None
     if params_json:
         params = json.loads(params_json)
@@ -4168,6 +4364,7 @@ def db_pg96_explain_query(
     verbose: bool = False,
     settings: bool = False,
     output_format: str = "json",
+    source_prompt: str | None = None,
 ) -> dict[str, Any]:
     """
     Get the execution plan for a query.
@@ -4187,6 +4384,11 @@ def db_pg96_explain_query(
     logger.info(
         f"explain_query called. output_format={output_format.strip().lower()} analyze={analyze} buffers={buffers} "
         f"verbose={verbose} settings={settings} sql_len={len(sql)} sql_sha256={sql_fingerprint}"
+    )
+    _write_audit_event(
+        tool_name="db_pg96_explain_query",
+        sql_text=sql,
+        source_prompt=source_prompt,
     )
     _require_readonly(sql)
     fmt = output_format.strip().lower()

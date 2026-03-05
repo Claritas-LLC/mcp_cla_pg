@@ -4,6 +4,10 @@ A powerful Model Context Protocol (MCP) server for PostgreSQL database administr
 
 This server exposes a suite of DBA-grade tools to inspect schemas, analyze performance, check security, and troubleshoot issues—all through a safe, controlled interface.
 
+## 🧪 Audit Evidence
+
+For hardening-audit artifacts (credential scoping, rate limiting/circuit breaker, and prompt audit logging), see [AUDIT_EVIDENCE_PACK.md](AUDIT_EVIDENCE_PACK.md).
+
 ## 📌 Current Release
 
 - Git tag: `v1.0.3`
@@ -291,6 +295,15 @@ To prevent the MCP server from becoming unresponsive or overloading the database
 | `MCP_CONFIRM_WRITE` | **Required if ALLOW_WRITE=true**. Safety latch to confirm write mode. | `false` |
 | `MCP_POOL_MAX_WAITING` | Max queries queued when pool is full | `20` |
 | `MCP_STATEMENT_TIMEOUT_MS` | Max execution time per query in milliseconds | `120000` (2 minutes) |
+| `MCP_RATE_LIMIT_ENABLED` | Enable query-level token-bucket rate limiting and breaker | `true` |
+| `MCP_RATE_LIMIT_PER_MINUTE` | Allowed query executions per minute before throttling | `600` |
+| `MCP_BREAKER_TRIP_REJECTIONS` | Consecutive throttles before opening breaker | `20` |
+| `MCP_BREAKER_OPEN_SECONDS` | Seconds to hold breaker open after trip | `30` |
+| `MCP_ENFORCE_TABLE_SCOPE` | Validate DB credential can only `SELECT` allowed tables at startup | `false` |
+| `MCP_ALLOWED_TABLES` | Comma-separated allowed table list (`schema.table`) when scope enforcement is enabled | `""` |
+| `MCP_AUDIT_LOG_FILE` | JSONL file path for query audit events (includes `source_prompt`) | `mcp_audit.log` |
+| `MCP_AUDIT_LOG_SQL_TEXT` | Include raw SQL text in audit events (otherwise hash/length only) | `false` |
+| `MCP_AUDIT_REQUIRE_PROMPT` | Require `source_prompt` for `run_query`/`explain_query` calls | `false` |
 | `MCP_SKIP_CONFIRMATION` | Set to "true" to skip startup confirmation dialog (Windows) | `false` |
 | `MCP_LOG_LEVEL` | Logging level (DEBUG, INFO, WARNING, ERROR) | `INFO` |
 | `MCP_LOG_FILE` | Optional path to write logs to a file | *None* |
@@ -299,6 +312,11 @@ To prevent the MCP server from becoming unresponsive or overloading the database
 If `MCP_ALLOW_WRITE=true`, the server enforces the following additional security checks at startup:
 1. **Explicit Confirmation**: You must set `MCP_CONFIRM_WRITE=true`.
 2. **Mandatory Authentication (HTTP)**: If using `http` transport, you must configure `FASTMCP_AUTH_TYPE` (e.g., `azure-ad`, `oidc`, `jwt`). Write mode over unauthenticated HTTP is prohibited.
+
+Additional hardening controls:
+1. **Credential Scoping (Optional Enforcement)**: set `MCP_ENFORCE_TABLE_SCOPE=true` and provide `MCP_ALLOWED_TABLES=schema1.table1,schema1.table2`. Startup fails if the DB user can `SELECT` outside that list.
+2. **Rate Limiting + Circuit Breaker**: query execution is token-bucket throttled and opens a temporary breaker under sustained overload.
+3. **Prompt Audit Logging**: `db_pg96_run_query` and `db_pg96_explain_query` can persist the exact `source_prompt` to `MCP_AUDIT_LOG_FILE`.
 
 > ⚠️ **Warning: Authentication Verification Pending**
 > **Token Auth** and **Azure AD Auth** have not been tested and are **not production-ready**.
@@ -453,7 +471,7 @@ This server implements strict security practices for logging:
 - `db_pg96_check_bloat(limit: int = 50)`: Identifies the top bloated tables and indexes and provides maintenance commands.
 - `db_pg96_analyze_indexes(schema: str = None, limit: int = 50, detail_level: str = "full", max_items_per_category: int = None, response_format: str = "legacy")`: Identify unused, duplicate, or missing indexes.
 - `db_pg96_recommend_partitioning(min_size_gb: float = 1.0, schema: str = None)`: Suggest tables for partitioning.
-- `db_pg96_explain_query(sql: str, analyze: bool = False, output_format: str = "json")`: Get the execution plan for a query.
+- `db_pg96_explain_query(sql: str, analyze: bool = False, output_format: str = "json", source_prompt: str | None = None)`: Get the execution plan for a query with optional prompt audit logging.
 
 ### 🕵️ Session & Security
 - `db_pg96_monitor_sessions(limit: int = 50)`: Real-time session monitoring data for the UI dashboard.
@@ -466,7 +484,7 @@ This server implements strict security practices for logging:
 - `db_pg96_create_db_user(username: str, password: str, privileges: str = "read", database: str | None = None)`: Create a new database user. Defaults to the current database if `database` is not specified.
 - `db_pg96_drop_db_user(username: str)`: Remove a role.
 - `db_pg96_kill_session(pid: int)`: Terminate a specific backend PID.
-- `db_pg96_run_query(sql: str, params_json: str | None = None, max_rows: int | None = None)`: Execute ad-hoc SQL. `max_rows` defaults to 500 (configurable via `MCP_MAX_ROWS`). Returns up to `max_rows` rows; if truncated, `truncated: true` is set.
+- `db_pg96_run_query(sql: str, params_json: str | None = None, max_rows: int | None = None, source_prompt: str | None = None)`: Execute ad-hoc SQL. `max_rows` defaults to 500 (configurable via `MCP_MAX_ROWS`). Returns up to `max_rows` rows; if truncated, `truncated: true` is set. Provide `source_prompt` to store exact AI prompt in the audit log.
 - `db_pg96_create_object(object_type: str, object_name: str, schema: str = None, owner: str = None, parameters: dict = None)`: Create database objects (table, view, index, function, etc.).
 - `db_pg96_alter_object(object_type: str, object_name: str, operation: str, schema: str = None, owner: str = None, parameters: dict = None)`: Modify database objects (add/rename column, set owner, etc.).
 - `db_pg96_drop_object(object_type: str, object_name: str, schema: str = None, parameters: dict = None)`: Drop database objects with optional `cascade` or `if_exists`.

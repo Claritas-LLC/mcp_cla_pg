@@ -262,6 +262,43 @@ Notes:
 - Repeat GRANTs per schema beyond `public` as needed.
 - ALTER DEFAULT PRIVILEGES affects objects created by the specified role; include `FOR ROLE <creator>` to cover other creators.
 
+### Optional Runtime Credential Scope Enforcement
+
+To enforce least privilege at MCP startup (fail fast if the credential can read beyond approved tables):
+
+```bash
+MCP_ENFORCE_TABLE_SCOPE=true
+MCP_ALLOWED_TABLES=public.customers,public.orders,analytics.daily_metrics
+```
+
+Behavior:
+- Server startup fails if the DB user can `SELECT` any non-system table outside `MCP_ALLOWED_TABLES`.
+- Server startup fails if `MCP_ALLOWED_TABLES` includes a table the user cannot `SELECT`.
+- In read-only mode (`MCP_ALLOW_WRITE=false`), startup fails if table-level write privileges are detected.
+
+### Query Flood Protection (Rate Limit + Circuit Breaker)
+
+The server supports query-level throttling to protect against runaway AI loops:
+
+```bash
+MCP_RATE_LIMIT_ENABLED=true
+MCP_RATE_LIMIT_PER_MINUTE=600
+MCP_BREAKER_TRIP_REJECTIONS=20
+MCP_BREAKER_OPEN_SECONDS=30
+```
+
+### Prompt-to-Query Audit Logging
+
+`db_pg96_run_query` and `db_pg96_explain_query` accept optional `source_prompt` and write JSONL audit records.
+
+```bash
+MCP_AUDIT_LOG_FILE=mcp_audit.log
+MCP_AUDIT_LOG_SQL_TEXT=false
+MCP_AUDIT_REQUIRE_PROMPT=false
+```
+
+Set `MCP_AUDIT_REQUIRE_PROMPT=true` to reject query-tool calls that omit `source_prompt`.
+
 
 To automate deployment, you can set up a GitHub Action workflow that:
 1.  Triggers on push to `main`.
