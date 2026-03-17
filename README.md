@@ -10,23 +10,36 @@ For hardening-audit artifacts (credential scoping, rate limiting/circuit breaker
 
 ## 📌 Current Release
 
-- Git tag: `v1.0.3`
-- Docker tags: `harryvaldez/mcp-postgres:latest`, `harryvaldez/mcp-postgres:v1.0.3`, `harryvaldez/mcp-postgres:71703f4`
-- Image digest: `sha256:ca03612267f9a34fc30b28277a999e703441c9a4e6374a05ec0d47e3ce0a2430`
+- Git tag: `v1.1.0`
+- Docker tags: `harryvaldez/mcp-postgres:latest`, `harryvaldez/mcp-postgres:v1.1.0`, `harryvaldez/mcp-postgres:1.0.0`
+- Image digest: `sha256:602e3d7d7603ca6da1987e41fb1a21ef2d4bbaf90f601dee0828d7d535701dd5`
 
-### Latest Publish Snapshot (2026-03-05)
+### Latest Publish Snapshot (2026-03-17)
 
-- Git commit: `4aafa3e` (pushed to `main`)
-- Docker tags pushed: `harryvaldez/mcp-postgres:latest`, `harryvaldez/mcp-postgres:4aafa3e`
-- Docker image digest: `sha256:81c7d249e4202277adcb6a20e4fbb21952e31b3d7b633e6ca8869f986a62b073`
+- Git commit: `547e383` (pushed to `main`)
+- Docker tags pushed: `harryvaldez/mcp-postgres:latest`, `harryvaldez/mcp-postgres:1.0.0`
+- Docker image digest: `sha256:602e3d7d7603ca6da1987e41fb1a21ef2d4bbaf90f601dee0828d7d535701dd5`
 
 ### Release History
 
 | Date | Git commit | Docker tags | Image digest |
 |------|------------|-------------|--------------|
+| 2026-03-17 | `547e383` | `latest`, `1.0.0` | `sha256:602e3d7d7603ca6da1987e41fb1a21ef2d4bbaf90f601dee0828d7d535701dd5` |
 | 2026-03-05 | `4aafa3e` | `latest`, `4aafa3e` | `sha256:81c7d249e4202277adcb6a20e4fbb21952e31b3d7b633e6ca8869f986a62b073` |
 | 2026-03-05 | `c6286d4` | `latest`, `c6286d4` | `sha256:81c7d249e4202277adcb6a20e4fbb21952e31b3d7b633e6ca8869f986a62b073` |
 | 2026-03-05 | `39fcfd2` | `latest`, `39fcfd2` | `sha256:d3bb0c2903f5a6e249d2d803fc87929f3ea9e350b15ab47c89e9998e0a3d82a8` |
+
+### v1.1.0 Release Notes
+
+- **Background Tasks Support**: Added FastMCP background tasks (SEP-1686) for long-running operations.
+- **New Async Tools**: Added 6 new async tools with `task=True` for background execution:
+  - `db_pg96_analyze_logical_data_model_async`
+  - `db_pg96_analyze_indexes_async`
+  - `db_pg96_check_bloat_async`
+  - `db_pg96_analyze_sessions_async`
+  - `db_pg96_recommend_partitioning_async`
+- **Progress Reporting**: Added Progress dependency for real-time progress updates during background task execution.
+- Server-level tasks support via `FASTMCP_TASKS_ENABLED` or `MCP_TASKS_ENABLED` environment variable.
 
 ### v1.0.3 Release Notes
 
@@ -635,6 +648,15 @@ This server implements strict security practices for logging:
 - `db_pg96_analyze_indexes(schema: str = None, limit: int = 50, detail_level: str = "full", max_items_per_category: int = None, response_format: str = "legacy")`: Identify unused, duplicate, or missing indexes.
 - `db_pg96_recommend_partitioning(min_size_gb: float = 1.0, schema: str = None)`: Suggest tables for partitioning.
 - `db_pg96_explain_query(sql: str, analyze: bool = False, buffers: bool = False, verbose: bool = False, settings: bool = False, output_format: str = "json", source_prompt: str | None = None)`: Get the execution plan for a query with optional prompt audit logging. `buffers` includes buffer usage, `verbose` adds detailed plan fields, and `settings` includes planner configuration values (all default to `False`).
+
+### ⚡ Background Tasks (Async)
+These tools support FastMCP background tasks (SEP-1686) for long-running operations with progress reporting. Enable with `FASTMCP_TASKS_ENABLED=true`:
+
+- `db_pg96_analyze_logical_data_model_async(schema: str = "public", include_views: bool = False, max_entities: int = None, include_attributes: bool = True, detail_level: str = "full", response_format: str = "legacy")`: **(Async)** Background task version of logical data model analysis.
+- `db_pg96_analyze_indexes_async(schema: str = None, detail_level: str = "compact", max_items_per_category: int = 20, response_format: str = "legacy")`: **(Async)** Background task version of index analysis.
+- `db_pg96_check_bloat_async(limit: int = 50)`: **(Async)** Background task version of bloat checking.
+- `db_pg96_analyze_sessions_async(include_idle: bool = True, include_active: bool = True, include_locked: bool = True, min_duration_seconds: int = 60, min_idle_seconds: int = 60)`: **(Async)** Background task version of session analysis.
+- `db_pg96_recommend_partitioning_async(schema: str = "public", min_size_gb: float = 1.0)`: **(Async)** Background task version of partitioning recommendations.
 
 ### 🕵️ Session & Security
 - `db_pg96_monitor_sessions(limit: int = 50)`: Real-time session monitoring data for the UI dashboard.
