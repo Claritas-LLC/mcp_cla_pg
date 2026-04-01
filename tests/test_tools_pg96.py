@@ -266,10 +266,10 @@ def _call_all_tools() -> None:
 
     params = _invoke(server, "db_pg96_get_db_parameters", {"pattern": "max_connections|shared_buffers"})
     param_rows = _coerce_rows(params)
-    if len(param_rows) == 0:
-        params = _invoke(server, "db_pg96_get_db_parameters")
-        param_rows = _coerce_rows(params)
-    _assert(len(param_rows) >= 1, f"get_db_parameters returned no rows (type={type(params).__name__})")
+    _assert(
+        len(param_rows) >= 1,
+        f"get_db_parameters(pattern) returned no rows (type={type(params).__name__})",
+    )
 
     dbs = _invoke(server, "db_pg96_list_objects", {"object_type": "database"})
     _assert(isinstance(dbs, list) and any(r.get("name") == DB for r in dbs), "list_objects(database) did not include test database")
@@ -313,6 +313,12 @@ def _call_all_tools() -> None:
 
     secperf = _invoke(server, "db_pg96_db_sec_perf_metrics")
     _assert(isinstance(secperf, dict) and "issues_found" in secperf, "db_sec_perf_metrics returned unexpected shape")
+
+    secperf_full = _invoke(server, "db_pg96_database_security_performance_metrics")
+    _assert(
+        isinstance(secperf_full, dict) and "issues_found" in secperf_full,
+        "database_security_performance_metrics returned unexpected shape",
+    )
 
     username = f"mcp_test_user_{int(time.time())}"
     created = _invoke(

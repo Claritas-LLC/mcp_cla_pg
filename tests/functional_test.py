@@ -5,6 +5,7 @@ import subprocess
 import time
 import importlib
 import sys
+from typing import Any, cast
 
 import pytest
 from psycopg_pool import ConnectionPool
@@ -104,8 +105,10 @@ def db_pool(mocker, docker_up_down):
 
 def test_functional_suite(db_pool):
     print("=== Starting Functional Tests ===")
-    def get_tool(name: str):
-        return asyncio.run(server_module.mcp.get_tool(name))
+    def get_tool(name: str) -> Any:
+        tool = asyncio.run(server_module.mcp.get_tool(name))
+        assert tool is not None, f"Tool '{name}' not found"
+        return cast(Any, tool)
 
     db_pool.open()
     try:
