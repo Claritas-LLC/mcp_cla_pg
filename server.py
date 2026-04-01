@@ -1455,7 +1455,7 @@ async def root(_request: Request) -> HTMLResponse:
     """)
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"destructiveHint": True, "openWorldHint": False}, timeout=60.0)
 def db_pg96_create_db_user(
     username: str,
     password: str,
@@ -1582,7 +1582,7 @@ def db_pg96_create_db_user(
                 )
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"destructiveHint": True, "openWorldHint": False}, timeout=60.0)
 def db_pg96_drop_db_user(username: str) -> str:
     """
     Drops a database user (role).
@@ -1614,7 +1614,7 @@ def db_pg96_drop_db_user(username: str) -> str:
             return f"User '{username}' dropped successfully."
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"destructiveHint": True, "openWorldHint": False}, timeout=90.0)
 def db_pg96_alter_object(
     object_type: str,
     object_name: str,
@@ -1880,7 +1880,7 @@ def db_pg96_alter_object(
             return f"Operation '{op}' on {obj_type} '{object_name}' completed successfully."
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"destructiveHint": True, "openWorldHint": False}, timeout=90.0)
 def db_pg96_create_object(
     object_type: str,
     object_name: str,
@@ -2127,7 +2127,7 @@ def db_pg96_create_object(
             return f"{obj_type.capitalize()} '{object_name}' created successfully."
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"destructiveHint": True, "openWorldHint": False}, timeout=90.0)
 def db_pg96_drop_object(
     object_type: str,
     object_name: str,
@@ -2252,7 +2252,7 @@ def db_pg96_drop_object(
             return f"{obj_type.capitalize()} '{object_name}' dropped successfully."
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=90.0)
 def db_pg96_check_bloat(limit: int = 50) -> list[dict[str, Any]]:
     """
     Identifies the top bloated tables and indexes and provides maintenance commands.
@@ -2365,7 +2365,7 @@ def db_pg96_check_bloat(limit: int = 50) -> list[dict[str, Any]]:
             return cur.fetchall()
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=60.0)
 def db_pg96_db_stats(database: str | None = None, include_performance: bool = False) -> list[dict[str, Any]] | dict[str, Any]:
     """
     Get database-level statistics including commits, rollbacks, temp files, and deadlocks.
@@ -2467,7 +2467,7 @@ def db_pg96_db_stats(database: str | None = None, include_performance: bool = Fa
                 return results
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=120.0)
 def db_pg96_analyze_table_health(
     schema: str | None = None,
     min_size_mb: int = 50,
@@ -2796,7 +2796,7 @@ def db_pg96_analyze_table_health(
             )
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=120.0)
 def db_pg96_db_sec_perf_metrics(
     cache_hit_threshold: int | None = None,
     connection_usage_threshold: float | None = None,
@@ -3159,7 +3159,7 @@ def db_pg96_db_sec_perf_metrics(
             )
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=120.0)
 def db_pg96_database_security_performance_metrics(
     cache_hit_threshold: int | None = None,
     connection_usage_threshold: float | None = None,
@@ -3181,7 +3181,7 @@ def db_pg96_database_security_performance_metrics(
     )
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=90.0)
 def db_pg96_recommend_partitioning(
     min_size_gb: float = 1.0,
     schema: str | None = None,
@@ -3337,7 +3337,7 @@ def db_pg96_recommend_partitioning(
             return results
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=90.0)
 def db_pg96_analyze_sessions(
     include_idle: bool = True,
     include_active: bool = True,
@@ -3506,7 +3506,7 @@ def db_pg96_analyze_sessions(
             return results
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"destructiveHint": True, "openWorldHint": False}, timeout=30.0)
 def db_pg96_kill_session(pid: int) -> dict[str, Any]:
     """
     Terminates a database session by its process ID (PID).
@@ -3540,7 +3540,7 @@ def db_pg96_kill_session(pid: int) -> dict[str, Any]:
 
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=30.0)
 def db_pg96_server_info() -> dict[str, Any]:
     """
     Retrieves information about the current PostgreSQL server connection and version.
@@ -3577,7 +3577,7 @@ def db_pg96_server_info() -> dict[str, Any]:
             }
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=60.0)
 def db_pg96_get_db_parameters(pattern: str | None = None) -> list[dict[str, Any]]:
     """
     Retrieves database configuration parameters (GUCs).
@@ -3639,7 +3639,7 @@ def db_pg96_get_db_parameters(pattern: str | None = None) -> list[dict[str, Any]
             return cur.fetchall()
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=90.0)
 def db_pg96_list_objects(
     object_type: str,
     schema: str | None = None,
@@ -3958,7 +3958,7 @@ def db_pg96_list_objects(
 
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=90.0)
 def db_pg96_analyze_indexes(
     schema: str | None = None,
     limit: int = 50,
@@ -4099,7 +4099,7 @@ def db_pg96_analyze_indexes(
             )
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=120.0)
 def db_pg96_analyze_logical_data_model(
     schema: str = "public",
     include_views: bool = False,
@@ -4579,7 +4579,7 @@ def db_pg96_analyze_logical_data_model(
 
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=60.0)
 def db_pg96_describe_table(schema: str, table: str) -> dict[str, Any]:
     """
     Get detailed information about a table's structure, including columns, indexes, and size.
@@ -4660,7 +4660,7 @@ def db_pg96_describe_table(schema: str, table: str) -> dict[str, Any]:
             }
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"openWorldHint": False}, timeout=120.0)
 def db_pg96_run_query(
     sql: str,
     params_json: str | None = None,
@@ -4728,7 +4728,7 @@ def db_pg96_run_query(
             }
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"openWorldHint": False}, timeout=120.0)
 def db_pg96_explain_query(
     sql: str,
     analyze: bool = False,
@@ -4790,7 +4790,7 @@ def db_pg96_explain_query(
             return {"format": "text", "plan": text}
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=15.0)
 def db_pg96_ping() -> dict[str, Any]:
     """
     Check if the MCP server is responsive.
@@ -4801,7 +4801,7 @@ def db_pg96_ping() -> dict[str, Any]:
     return {"ok": True}
 
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=30.0)
 def db_pg96_server_info_mcp() -> dict[str, Any]:
     """
     Get information about the MCP server configuration and status.
@@ -5407,7 +5407,7 @@ async def api_sessions(_request: Request) -> JSONResponse:
 async def health_check(_request: Request) -> JSONResponse:
     return JSONResponse({"status": "healthy"})
 
-@mcp.tool(tags={"public"})
+@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=30.0)
 def db_pg96_monitor_sessions() -> str:
     """
     Get the link to the real-time database sessions monitor dashboard.
@@ -5546,7 +5546,7 @@ def main() -> None:
 from fastmcp.dependencies import Progress
 
 
-@mcp.tool(tags={"public"}, task=True)
+@mcp.tool(tags={"public"}, task=True, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False})
 async def db_pg96_analyze_logical_data_model_async(
     schema: str = "public",
     include_views: bool = False,
@@ -5860,7 +5860,7 @@ async def db_pg96_analyze_logical_data_model_async(
             )
 
 
-@mcp.tool(tags={"public"}, task=True)
+@mcp.tool(tags={"public"}, task=True, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False})
 async def db_pg96_analyze_indexes_async(
     schema: str | None = None,
     detail_level: str = "compact",
@@ -5986,7 +5986,7 @@ async def db_pg96_analyze_indexes_async(
             )
 
 
-@mcp.tool(tags={"public"}, task=True)
+@mcp.tool(tags={"public"}, task=True, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False})
 async def db_pg96_check_bloat_async(
     limit: int = 50,
     progress: Progress = Progress(),
@@ -6109,7 +6109,7 @@ async def db_pg96_check_bloat_async(
             return cur.fetchall()
 
 
-@mcp.tool(tags={"public"}, task=True)
+@mcp.tool(tags={"public"}, task=True, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False})
 async def db_pg96_analyze_sessions_async(
     include_idle: bool = True,
     include_active: bool = True,
@@ -6251,7 +6251,7 @@ async def db_pg96_analyze_sessions_async(
             return results
 
 
-@mcp.tool(tags={"public"}, task=True)
+@mcp.tool(tags={"public"}, task=True, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False})
 async def db_pg96_recommend_partitioning_async(
     schema: str = "public",
     min_size_gb: float = 1.0,
