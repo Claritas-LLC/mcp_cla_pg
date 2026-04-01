@@ -678,7 +678,7 @@ class BrowserFriendlyMiddleware(BaseHTTPMiddleware):
                                 <div class="flex items-start mb-6 bg-blue-50 p-4 rounded-xl border border-blue-100">
                                     <div class="bg-blue-500 text-white rounded-full p-2 mr-4 mt-1">
                                         <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="id-circle" />
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm0-14c-2.21 0-4 1.79-4 4h2c0-1.1.9-2 2-2s2 .9 2 2h2c0-2.21-1.79-4-4-4z" />
                                             <circle cx="12" cy="12" r="9" />
                                             <line x1="12" y1="8" x2="12" y2="12" />
                                             <line x1="12" y1="16" x2="12.01" y2="16" />
@@ -4073,11 +4073,12 @@ def db_pg96_analyze_indexes(
                     results[key] = trimmed
 
             if response_format == "legacy":
-                results["_meta"] = {
-                    "detail_level": detail,
-                    "max_items_per_category": list_cap,
-                    "truncated": truncated,
-                }
+                if isinstance(results, dict):
+                    results["_meta"] = {
+                        "detail_level": detail,
+                        "max_items_per_category": list_cap,
+                        "truncated": truncated,
+                    }
                 return results
             if response_format != "envelope":
                 raise ValueError("response_format must be 'legacy' or 'envelope'")
@@ -5950,7 +5951,7 @@ async def db_pg96_analyze_indexes_async(
             unused_trimmed = _trim(list(unused_results), list_cap)
             dup_trimmed = _trim(list(duplicate_results), list_cap)
 
-            results = {
+            results: dict[str, Any] = {
                 "unused_indexes": unused_trimmed,
                 "duplicate_indexes": dup_trimmed,
             }
