@@ -329,7 +329,7 @@ def test_resources_prompts_and_async_context_compat(db_pool):
 
 
         prompts_list = asyncio.run(server_module.mcp.list_prompts())
-        prompt_names = {getattr(p, "name", p) for p in prompts_list}
+        prompt_names = {p.name if hasattr(p, "name") else str(p) for p in prompts_list}
         assert "explain_slow_query" in prompt_names
         assert "maintenance_recommendations" in prompt_names
 
@@ -360,7 +360,7 @@ def test_resources_prompts_and_async_context_compat(db_pool):
         # Verify async tools are discoverable via MCP runtime API.
 
         tools_list = asyncio.run(server_module.mcp.list_tools())
-        discovered_tools = {getattr(t, "name", t) for t in tools_list}
+        discovered_tools = {t.name if hasattr(t, "name") else str(t) for t in tools_list}
         assert "db_pg96_analyze_indexes_async" in discovered_tools
         assert "db_pg96_analyze_sessions_async" in discovered_tools
         assert "db_pg96_analyze_logical_data_model_async" in discovered_tools
@@ -379,7 +379,7 @@ def test_resources_prompts_and_async_context_compat(db_pool):
 
         # --- Phase 4: runtime_context_brief prompt ---
         prompts_list = asyncio.run(server_module.mcp.list_prompts())
-        prompt_names = {getattr(p, "name", p) for p in prompts_list}
+        prompt_names = {p.name if hasattr(p, "name") else str(p) for p in prompts_list}
         assert "runtime_context_brief" in prompt_names
         # Do not call runtime_context_brief directly; requires active MCP context
 
