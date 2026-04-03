@@ -40,6 +40,14 @@ For hardening-audit artifacts (credential scoping, rate limiting/circuit breaker
   - `db_pg96_recommend_partitioning_async`
 - **Progress Reporting**: Added Progress dependency for real-time progress updates during background task execution.
 - Server-level tasks support via `FASTMCP_TASKS_ENABLED` or `MCP_TASKS_ENABLED` environment variable.
+- **Phase 4 FastMCP Alignment**: Advanced server capabilities including:
+  - **Capabilities Resource**: Standardized `data://server/capabilities` resource exposing server metadata and feature discovery.
+  - **Runtime Context Prompt**: New `runtime_context_brief` prompt for contextual information injection.
+  - **Server Composition**: Child server mounting with namespace routing for modular architecture.
+  - **Dependency Injection**: Built-in support for context-aware tool dependencies via `CurrentContext` and `CurrentFastMCP`.
+  - **Elicitation Patterns**: Structured prompts for guided user interactions and decision workflows.
+  - **Enhanced Logging**: Structured logging with configurable levels and outputs via `MCP_LOG_LEVEL` and `MCP_LOG_FILE`.
+  - **Advanced Configuration**: Comprehensive server configuration through environment variables with safe defaults.
 
 ### v1.0.3 Release Notes
 
