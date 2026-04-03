@@ -4,7 +4,7 @@ import sys
 import time
 import traceback
 import ast
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import psycopg
@@ -120,6 +120,46 @@ def _static_inventory_check() -> None:
     _assert(not extra, f"Unexpected tools found in server.py: {extra}")
 
 
+def _scan_server_resources_and_prompts() -> tuple[list[str], list[str]]:
+    with open(SERVER_FILE, "r", encoding="utf-8") as f:
+        src = f.read()
+    tree = ast.parse(src, filename=SERVER_FILE)
+
+    resources: list[str] = []
+    prompts: list[str] = []
+
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            target = dec.func if isinstance(dec, ast.Call) else dec
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "mcp"
+                and target.attr == "resource"
+            ):
+                if isinstance(dec, ast.Call) and dec.args and isinstance(dec.args[0], ast.Constant) and isinstance(dec.args[0].value, str):
+                    resources.append(dec.args[0].value)
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "mcp"
+                and target.attr == "prompt"
+            ):
+                if isinstance(dec, ast.Call):
+                    for kw in dec.keywords:
+                        if kw.arg == "name" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                            prompts.append(kw.value.value)
+                            break
+                    else:
+                        prompts.append(node.name)
+                else:
+                    prompts.append(node.name)
+
+    return sorted(set(resources)), sorted(set(prompts))
+
+
 def _assert_async_context_injection_contract() -> None:
     with open(SERVER_FILE, "r", encoding="utf-8") as f:
         src = f.read()
@@ -161,6 +201,7 @@ def _assert_async_context_injection_contract() -> None:
     for fn_name, prefix in expected_positional_prefix.items():
         fn = functions.get(fn_name)
         _assert(fn is not None, f"Expected async function '{fn_name}' not found")
+        fn = cast(ast.AsyncFunctionDef, fn)
         args = [arg.arg for arg in fn.args.args]
         _assert(
             args[: len(prefix)] == prefix,
@@ -175,6 +216,14 @@ def _assert_async_context_injection_contract() -> None:
             and default.func.id == "CurrentContext",
             f"Expected CurrentContext() default for {fn_name}.ctx",
         )
+
+
+def test_static_resources_and_prompts_inventory() -> None:
+    resources, prompts = _scan_server_resources_and_prompts()
+    assert "data://server/status" in resources
+    assert "data://db/settings{?pattern,limit}" in resources
+    assert "explain_slow_query" in prompts
+    assert "maintenance_recommendations" in prompts
 
 
 def _wait_for_db(timeout_s: int = 60) -> None:
@@ -407,7 +456,9 @@ def _call_all_tools() -> None:
     try:
         with victim.cursor() as cur:
             cur.execute("select pg_backend_pid() as pid")
-            pid = cur.fetchone()[0]
+            row = cur.fetchone()
+            _assert(row is not None, "Failed to fetch backend pid")
+            pid = row[0]
         killed = _invoke(server, "db_pg96_kill_session", {"pid": pid})
         _assert(isinstance(killed, dict) and killed.get("pid") == pid, "kill_session did not echo pid")
 

@@ -13,19 +13,15 @@ import threading
 import atexit
 import signal
 import decimal
-from dataclasses import dataclass
 from datetime import datetime, date, timedelta, timezone
 from urllib.parse import quote, urlparse, urlunparse, urlsplit, urlunsplit
 from typing import Any, Literal, Optional, cast
 
 from sshtunnel import SSHTunnelForwarder
 from fastmcp import FastMCP
-from fastmcp.dependencies import CurrentContext, CurrentFastMCP, Depends, Progress
-from fastmcp.prompts import Message, PromptResult
-from fastmcp.resources import ResourceContent, ResourceResult
+from fastmcp.prompts import Message
 from fastmcp.server.context import Context
-from fastmcp.server.dependencies import get_context, get_http_headers
-from fastmcp.server.tasks import TaskConfig
+from fastmcp.dependencies import CurrentContext
 from psycopg import Error as PsycopgError
 from psycopg import sql
 from psycopg.errors import UndefinedTable
@@ -83,9 +79,6 @@ if log_file:
 
 logging.basicConfig(**_logging_kwargs)
 logger = logging.getLogger("mcp-postgres")
-
-if os.environ.get("MCP_ENABLE_CLIENT_LOG_DEBUG", "").strip().lower() in {"1", "true", "yes", "y", "on"}:
-    logging.getLogger("fastmcp.server.context.to_client").setLevel(logging.DEBUG)
 
 
 def _import_symbol(module_path: str, symbol_name: str) -> Any:
@@ -573,48 +566,6 @@ def _register_skills_resources() -> None:
             raise RuntimeError(f"Failed to read skill file '{skill_path}': {exc}") from exc
 
 
-def _di_runtime_mode() -> str:
-    return os.environ.get("MCP_RUNTIME_MODE", "default")
-
-
-def _di_http_headers() -> dict[str, str]:
-    # Safe on STDIO or non-HTTP transports: returns empty dict when request headers are unavailable.
-    return get_http_headers()
-
-
-def _di_request_id_from_context() -> str | None:
-    """Resolve request ID through get_context() for nested helper-style DI."""
-    try:
-        return get_context().request_id
-    except Exception:
-        return None
-
-
-@dataclass
-class ElicitedMaintenanceTicket:
-    title: str
-    owner: str
-    priority: Literal["low", "medium", "high"]
-
-
-def _supports_fastmcp_param(param_name: str) -> bool:
-    try:
-        return param_name in inspect.signature(FastMCP).parameters
-    except Exception:
-        return False
-
-
-def _env_duplicate_behavior(name: str) -> str | None:
-    value = os.environ.get(name)
-    if value is None or value.strip() == "":
-        return None
-    parsed = value.strip().lower()
-    if parsed not in {"warn", "error", "replace", "ignore"}:
-        logger.warning("Ignoring invalid duplicate behavior for %s: %r", name, value)
-        return None
-    return parsed
-
-
 # Initialize FastMCP
 auth_type = os.environ.get("FASTMCP_AUTH_TYPE", "").lower()
 tasks_enabled = _env_optional_bool("FASTMCP_TASKS_ENABLED")
@@ -633,7 +584,7 @@ list_page_size = _env_optional_positive_int("FASTMCP_LIST_PAGE_SIZE")
 if list_page_size is None:
     list_page_size = _env_optional_positive_int("MCP_LIST_PAGE_SIZE")
 sampling_handler, sampling_handler_behavior = _get_sampling_handler_config()
-_mcp_kwargs: dict[str, Any] = {
+_fastmcp_candidate_kwargs: dict[str, Any] = {
     "name": os.environ.get("MCP_SERVER_NAME", "PostgreSQL MCP Server"),
     "auth": _get_auth() if auth_type != "apikey" else None,
     "tasks": tasks_enabled,
@@ -641,42 +592,48 @@ _mcp_kwargs: dict[str, Any] = {
     "sampling_handler": sampling_handler,
     "sampling_handler_behavior": sampling_handler_behavior,
 }
+_fastmcp_supported_params = set(inspect.signature(FastMCP).parameters.keys())
+_fastmcp_init_kwargs = {
+    key: value
+    for key, value in _fastmcp_candidate_kwargs.items()
+    if key in _fastmcp_supported_params and value is not None
+}
 
-if _supports_fastmcp_param("instructions"):
-    _mcp_kwargs["instructions"] = os.environ.get(
-        "MCP_SERVER_INSTRUCTIONS",
-        "PostgreSQL operations server. Prefer read-only tools first and require explicit intent for write operations.",
+_unsupported_init_keys = sorted(
+    key for key in _fastmcp_candidate_kwargs.keys() if key not in _fastmcp_supported_params
+)
+if _unsupported_init_keys:
+    logger.warning(
+        "Ignoring unsupported FastMCP init args for this installed version: %s",
+        ", ".join(_unsupported_init_keys),
     )
-if _supports_fastmcp_param("version") and os.environ.get("MCP_SERVER_VERSION"):
-    _mcp_kwargs["version"] = os.environ.get("MCP_SERVER_VERSION")
-if _supports_fastmcp_param("website_url") and os.environ.get("MCP_SERVER_WEBSITE_URL"):
-    _mcp_kwargs["website_url"] = os.environ.get("MCP_SERVER_WEBSITE_URL")
-if _supports_fastmcp_param("strict_input_validation"):
-    strict_validation_env = _env_optional_bool("MCP_STRICT_INPUT_VALIDATION")
-    if strict_validation_env is None:
-        strict_validation_env = _env_optional_bool("FASTMCP_STRICT_INPUT_VALIDATION")
-    if strict_validation_env is not None:
-        _mcp_kwargs["strict_input_validation"] = strict_validation_env
-if _supports_fastmcp_param("mask_error_details"):
-    mask_error_env = _env_optional_bool("MCP_MASK_ERROR_DETAILS")
-    if mask_error_env is None:
-        mask_error_env = _env_optional_bool("FASTMCP_MASK_ERROR_DETAILS")
-    if mask_error_env is not None:
-        _mcp_kwargs["mask_error_details"] = mask_error_env
-if _supports_fastmcp_param("on_duplicate_tools"):
-    on_dup_tools = _env_duplicate_behavior("MCP_ON_DUPLICATE_TOOLS") or _env_duplicate_behavior("FASTMCP_ON_DUPLICATE_TOOLS")
-    if on_dup_tools is not None:
-        _mcp_kwargs["on_duplicate_tools"] = on_dup_tools
-if _supports_fastmcp_param("on_duplicate_resources"):
-    on_dup_resources = _env_duplicate_behavior("MCP_ON_DUPLICATE_RESOURCES") or _env_duplicate_behavior("FASTMCP_ON_DUPLICATE_RESOURCES")
-    if on_dup_resources is not None:
-        _mcp_kwargs["on_duplicate_resources"] = on_dup_resources
-if _supports_fastmcp_param("on_duplicate_prompts"):
-    on_dup_prompts = _env_duplicate_behavior("MCP_ON_DUPLICATE_PROMPTS") or _env_duplicate_behavior("FASTMCP_ON_DUPLICATE_PROMPTS")
-    if on_dup_prompts is not None:
-        _mcp_kwargs["on_duplicate_prompts"] = on_dup_prompts
 
-mcp = FastMCP(**_mcp_kwargs)
+mcp = FastMCP(**_fastmcp_init_kwargs)
+
+
+def _wrap_component_decorator(name: str) -> None:
+    original = getattr(mcp, name)
+    supported = set(inspect.signature(original).parameters.keys())
+
+    def _wrapped(*args: Any, **kwargs: Any):
+        if kwargs:
+            filtered = {k: v for k, v in kwargs.items() if k in supported}
+            dropped = sorted(k for k in kwargs.keys() if k not in supported)
+            if dropped:
+                logger.warning(
+                    "Ignoring unsupported FastMCP %s decorator args: %s",
+                    name,
+                    ", ".join(dropped),
+                )
+            return original(*args, **filtered)
+        return original(*args, **kwargs)
+
+    setattr(mcp, name, _wrapped)
+
+
+_wrap_component_decorator("tool")
+_wrap_component_decorator("resource")
+_wrap_component_decorator("prompt")
 
 if include_tags:
     mcp.enable(tags=include_tags, only=True)
@@ -689,32 +646,163 @@ if include_fastmcp_meta is not None:
 
 _register_skills_resources()
 
-# Composition demo: mounted child server with namespace-scoped components.
-composition_demo = FastMCP(name="PostgreSQL MCP Composition Demo")
 
-
-@composition_demo.resource(
-    "data://info",
+@mcp.resource(
+    "data://server/status",
+    name="server_status",
+    description="Read-only snapshot of MCP server and PostgreSQL connection status.",
     mime_type="application/json",
     tags={"public"},
-    annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False},
+    annotations={"readOnlyHint": True, "idempotentHint": True},
 )
-def composition_info() -> str:
-    return json.dumps(
-        {
-            "component": "composition_demo",
-            "description": "Mounted child server for namespaced resources/prompts/tools.",
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        }
-    )
+def server_status_resource() -> str:
+    payload = {
+        "ok": True,
+        "server_name": os.environ.get("MCP_SERVER_NAME", "PostgreSQL MCP Server"),
+        "transport": os.environ.get("MCP_TRANSPORT", "http").strip().lower(),
+        "allow_write": ALLOW_WRITE,
+        "default_max_rows": DEFAULT_MAX_ROWS,
+        "statement_timeout_ms": STATEMENT_TIMEOUT_MS,
+        "database": {
+            "host": ORIGINAL_DB_HOST,
+            "port": ORIGINAL_DB_PORT,
+            "name": ORIGINAL_DB_NAME,
+        },
+        "tasks_enabled": tasks_enabled,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
-@composition_demo.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False})
-def composition_ping() -> dict[str, Any]:
-    return {"ok": True, "source": "composition_demo"}
+@mcp.resource(
+    "data://db/settings{?pattern,limit}",
+    name="db_settings",
+    description="Read PostgreSQL settings with optional regex name filter and result limit.",
+    mime_type="application/json",
+    tags={"public"},
+    annotations={"readOnlyHint": True, "idempotentHint": True},
+)
+def db_settings_resource(pattern: str | None = None, limit: int = 100) -> str:
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            if pattern:
+                _execute_safe(
+                    cur,
+                    """
+                    select
+                      name,
+                      setting,
+                      unit,
+                      category,
+                      short_desc,
+                      context,
+                      vartype,
+                      min_val,
+                      max_val,
+                      enumvals,
+                      boot_val,
+                      reset_val,
+                      pending_restart
+                    from pg_settings
+                    where name ~* %(pattern)s
+                    order by name
+                    limit %(limit)s
+                    """,
+                    {"pattern": pattern, "limit": limit},
+                )
+            else:
+                _execute_safe(
+                    cur,
+                    """
+                    select
+                      name,
+                      setting,
+                      unit,
+                      category,
+                      short_desc,
+                      context,
+                      vartype,
+                      min_val,
+                      max_val,
+                      enumvals,
+                      boot_val,
+                      reset_val,
+                      pending_restart
+                    from pg_settings
+                    order by name
+                    limit %(limit)s
+                    """,
+                    {"limit": limit},
+                )
+            rows = cur.fetchall()
+
+    payload = {
+        "pattern": pattern,
+        "limit": limit,
+        "count": len(rows),
+        "settings": rows,
+    }
+    return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-mcp.mount(composition_demo, namespace="composed")
+@mcp.prompt(
+    name="explain_slow_query",
+    description="Generate a deterministic checklist for query plan analysis before running explain.",
+    tags={"public"},
+)
+def explain_slow_query_prompt(sql: str, analyze: bool = False, buffers: bool = False) -> list[Message]:
+    options = [f"analyze={str(analyze).lower()}", f"buffers={str(buffers).lower()}"]
+    messages = [
+        Message(
+            "You are a PostgreSQL performance analyst. Provide concise, actionable tuning guidance from the execution plan."
+        ),
+        Message(
+            (
+                "Run db_pg96_explain_query with the following options and analyze only factual plan evidence.\\n"
+                f"SQL: {sql}\\n"
+                f"Options: {', '.join(options)}\\n"
+                "Output must include: top bottleneck, evidence lines, two index suggestions, and one query rewrite suggestion."
+            )
+        ),
+    ]
+    return messages
+
+
+@mcp.prompt(
+    name="maintenance_recommendations",
+    description="Generate profile-aware PostgreSQL maintenance checklist aligned with security/performance thresholds.",
+    tags={"public"},
+)
+def maintenance_recommendations_prompt(profile: str = "oltp") -> list[Message]:
+    profile_value = (profile or "oltp").lower()
+    if profile_value == "olap":
+        cache_threshold = 80
+        connection_threshold = 90
+        checkpoint_threshold = 50
+        temp_threshold = 500
+    else:
+        profile_value = "oltp"
+        cache_threshold = 95
+        connection_threshold = 70
+        checkpoint_threshold = 20
+        temp_threshold = 50
+
+    messages = [
+        Message(
+            (
+                "Produce a deterministic PostgreSQL maintenance checklist using these thresholds: "
+                f"cache_hit>={cache_threshold}%, connection_usage<={connection_threshold}%, "
+                f"checkpoint_request_ratio<={checkpoint_threshold}%, temp_files<={temp_threshold}."
+            )
+        ),
+        Message(
+            "Use this order: security baseline, vacuum/analyze hygiene, index hygiene, WAL/checkpoint tuning, connection management, and verification commands."
+        ),
+    ]
+    return messages
 
 # Backward-compatibility alias for tests/clients expecting `server` as the FastMCP app object.
 server = mcp
@@ -1032,9 +1120,8 @@ def _signal_handler(signum, frame):
     _cleanup_ssh_tunnel()
     sys.exit(0)
 
-if os.environ.get("MCP_REGISTER_SIGNAL_HANDLERS", "true").strip().lower() == "true":
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 
 pool = ConnectionPool(
@@ -1046,20 +1133,6 @@ pool = ConnectionPool(
     open=True,
     kwargs={"row_factory": dict_row, "options": "-c DateStyle=ISO,MDY"},
 )
-
-
-def _cleanup_pool() -> None:
-    """Close the global DB pool before interpreter finalization."""
-    try:
-        try:
-            pool.close(timeout=15.0)
-        except TypeError:
-            pool.close()
-    except Exception as e:
-        logger.error(f"Error closing DB connection pool: {e}")
-
-
-atexit.register(_cleanup_pool)
 
 
 def _parse_allowed_tables(raw_value: str) -> set[str]:
@@ -1459,6 +1532,24 @@ async def _fetch_limited_async(cur, max_rows: int) -> list[dict[str, Any]]:
     return rows
 
 
+async def _ctx_log(ctx: Context | None, level: Literal["debug", "info", "warning", "error"], message: str) -> None:
+    """Best-effort context logger that safely no-ops outside active MCP request scope."""
+    if ctx is None:
+        return
+    try:
+        if level == "debug":
+            await ctx.debug(message)
+        elif level == "info":
+            await ctx.info(message)
+        elif level == "warning":
+            await ctx.warning(message)
+        else:
+            await ctx.error(message)
+    except Exception:
+        # Context may be unavailable in non-request execution paths; ignore safely.
+        return
+
+
 def _execute_safe_with_fallback(
     cur,
     primary_sql: Any,
@@ -1480,531 +1571,6 @@ def _execute_safe_with_fallback(
         _rollback_cursor_connection(cur)
         _execute_safe(cur, fallback_sql, fallback_params)
         return False
-
-
-async def _context_safe_log(
-    ctx: Context | None,
-    level: Literal["debug", "info", "warning", "error"],
-    message: str,
-    extra: dict[str, Any] | None = None,
-) -> None:
-    """Best-effort context logging that safely no-ops without request context."""
-    if ctx is None:
-        return
-    try:
-        log_method = getattr(ctx, level, None)
-        if callable(log_method):
-            maybe_awaitable = log_method(message, extra=extra or {})
-            if inspect.isawaitable(maybe_awaitable):
-                await cast(Any, maybe_awaitable)
-    except Exception:
-        # Avoid impacting tool behavior if context logging is unavailable.
-        return
-
-
-def _ctx_optional(ctx: Context | None, attr: str) -> Any:
-    """Safely access Context properties that may raise before session establishment."""
-    if ctx is None:
-        return None
-    try:
-        return getattr(ctx, attr)
-    except Exception:
-        return None
-
-
-async def _context_state_get(ctx: Context, key: str) -> Any:
-    getter = getattr(ctx, "get_state", None)
-    if not callable(getter):
-        return None
-    maybe_result = getter(key)
-    if inspect.isawaitable(maybe_result):
-        return await cast(Any, maybe_result)
-    return maybe_result
-
-
-async def _context_state_set(ctx: Context, key: str, value: Any) -> None:
-    setter = getattr(ctx, "set_state", None)
-    if not callable(setter):
-        return
-    maybe_result = setter(key, value)
-    if inspect.isawaitable(maybe_result):
-        await cast(Any, maybe_result)
-
-
-async def _context_state_delete(ctx: Context, key: str) -> None:
-    deleter = getattr(ctx, "delete_state", None)
-    if callable(deleter):
-        maybe_result = deleter(key)
-        if inspect.isawaitable(maybe_result):
-            await cast(Any, maybe_result)
-        return
-    # Backward compatibility for Context versions without delete_state().
-    await _context_state_set(ctx, key, None)
-
-
-@mcp.resource(
-    "data://server/status",
-    mime_type="application/json",
-    tags={"public"},
-    annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False},
-)
-def resource_server_status(ctx: Context = CurrentContext()) -> ResourceResult:
-    """Return a compact snapshot of server runtime status and connection metadata."""
-    request_id: str | None = None
-    try:
-        request_id = ctx.request_id
-    except Exception:
-        request_id = None
-
-    payload = {
-        "ok": True,
-        "transport": os.environ.get("MCP_TRANSPORT", "http").strip().lower(),
-        "allow_write": ALLOW_WRITE,
-        "statement_timeout_ms": STATEMENT_TIMEOUT_MS,
-        "default_max_rows": DEFAULT_MAX_ROWS,
-        "database": {
-            "host": ORIGINAL_DB_HOST,
-            "port": ORIGINAL_DB_PORT,
-            "name": ORIGINAL_DB_NAME,
-        },
-        "request_id": request_id,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-    return ResourceResult(
-        contents=[
-            ResourceContent(
-                content=json.dumps(payload),
-                mime_type="application/json",
-            )
-        ],
-        meta={"resource": "server_status"},
-    )
-
-
-@mcp.resource(
-    "data://db/settings{?pattern,limit}",
-    mime_type="application/json",
-    tags={"public"},
-    annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False},
-)
-def resource_db_settings(pattern: str | None = None, limit: int = 50) -> str:
-    """Return PostgreSQL settings with optional regex filter and bounded limit."""
-    bounded_limit = max(1, min(limit, 500))
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            if pattern:
-                _execute_safe(
-                    cur,
-                    """
-                    select
-                      name,
-                      setting,
-                      unit,
-                      category,
-                      short_desc,
-                      context,
-                      pending_restart
-                    from pg_settings
-                    where name ~* %(pattern)s
-                    order by name
-                    limit %(limit)s
-                    """,
-                    {"pattern": pattern, "limit": bounded_limit},
-                )
-            else:
-                _execute_safe(
-                    cur,
-                    """
-                    select
-                      name,
-                      setting,
-                      unit,
-                      category,
-                      short_desc,
-                      context,
-                      pending_restart
-                    from pg_settings
-                    order by name
-                    limit %(limit)s
-                    """,
-                    {"limit": bounded_limit},
-                )
-            rows = cur.fetchall()
-
-    return json.dumps(
-        {
-            "pattern": pattern,
-            "limit": bounded_limit,
-            "count": len(rows),
-            "rows": rows,
-        }
-    )
-
-
-@mcp.resource(
-    "data://server/capabilities",
-    mime_type="application/json",
-    tags={"public"},
-    annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False},
-)
-async def resource_server_capabilities(ctx: Context = CurrentContext()) -> ResourceResult:
-    """Return MCP-visible resource/prompt capabilities for the current request context."""
-    try:
-        resources = await ctx.list_resources()
-    except Exception:
-        resources = []
-
-    try:
-        prompts = await ctx.list_prompts()
-    except Exception:
-        prompts = []
-
-    resource_samples = [
-        {
-            "uri": str(getattr(resource, "uri", "")),
-            "name": getattr(resource, "name", None),
-        }
-        for resource in resources[:20]
-    ]
-    prompt_samples = [
-        {
-            "name": getattr(prompt, "name", None),
-            "title": getattr(prompt, "title", None),
-        }
-        for prompt in prompts[:20]
-    ]
-
-    payload = {
-        "request_id": _ctx_optional(ctx, "request_id"),
-        "session_id": _ctx_optional(ctx, "session_id"),
-        "transport": _ctx_optional(ctx, "transport"),
-        "resource_count": len(resources),
-        "prompt_count": len(prompts),
-        "resource_samples": resource_samples,
-        "prompt_samples": prompt_samples,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-
-    return ResourceResult(
-        contents=[
-            ResourceContent(
-                content=json.dumps(payload),
-                mime_type="application/json",
-            )
-        ],
-        meta={"resource": "server_capabilities"},
-    )
-
-
-@mcp.prompt(tags={"public"}, title="Explain Slow Query")
-def explain_slow_query(sql: str, analyze: bool = False, buffers: bool = False) -> list[Message]:
-    """Generate a deterministic optimization request for SQL execution analysis."""
-    plan_mode = "ANALYZE" if analyze else "ESTIMATE"
-    buffers_mode = "ON" if buffers else "OFF"
-    return [
-        Message(
-            "You are a PostgreSQL performance assistant. Analyze the SQL statement and provide optimizations."
-        ),
-        Message(
-            {
-                "task": "explain_and_optimize",
-                "plan_mode": plan_mode,
-                "buffers": buffers_mode,
-                "required_sections": [
-                    "query_intent",
-                    "plan_findings",
-                    "index_recommendations",
-                    "rewrite_recommendations",
-                    "risk_assessment",
-                ],
-                "sql": sql,
-            }
-        ),
-    ]
-
-
-@mcp.prompt(tags={"public"}, title="Maintenance Recommendations")
-def maintenance_recommendations(profile: Literal["oltp", "olap"] = "oltp") -> PromptResult:
-    """Return a profile-specific maintenance checklist prompt."""
-    normalized_profile = profile.lower()
-    checklist = [
-        "Validate cache hit ratios against profile threshold.",
-        "Review checkpoint request ratio and WAL sizing.",
-        "Inspect dead tuples and vacuum/analyze recency.",
-        "Review long-running and idle-in-transaction sessions.",
-    ]
-    if normalized_profile == "olap":
-        checklist.append("Tune work_mem and temp file usage for scan-heavy analytics.")
-    else:
-        checklist.append("Tune connection pressure and autovacuum aggressiveness for OLTP churn.")
-
-    return PromptResult(
-        messages=[
-            Message(
-                {
-                    "task": "maintenance_checklist",
-                    "profile": normalized_profile,
-                    "checklist": checklist,
-                }
-            )
-        ],
-        description="Generate profile-specific PostgreSQL maintenance actions.",
-        meta={"profile": normalized_profile},
-    )
-
-
-@mcp.prompt(tags={"public"}, title="Runtime Context Brief")
-async def runtime_context_brief(topic: str, ctx: Context = CurrentContext()) -> PromptResult:
-    """Build a prompt payload that includes request-scoped FastMCP context details."""
-    payload = {
-        "task": "context_aware_brief",
-        "topic": topic,
-        "request_id": _ctx_optional(ctx, "request_id"),
-        "session_id": _ctx_optional(ctx, "session_id"),
-        "transport": _ctx_optional(ctx, "transport"),
-        "instructions": [
-            "Provide a concise answer with actionable PostgreSQL guidance.",
-            "Mention assumptions and unknowns explicitly.",
-            "Return one short SQL example when appropriate.",
-        ],
-    }
-    return PromptResult(
-        messages=[Message(payload)],
-        description="Generate a context-aware PostgreSQL guidance brief.",
-        meta={"topic": topic},
-    )
-
-
-@mcp.tool(
-    tags={"public"},
-    task=TaskConfig(mode="optional", poll_interval=timedelta(seconds=2)),
-    annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False},
-)
-async def task_progress_demo(
-    steps: int = 5,
-    progress: Progress = Progress(),
-    ctx: Context = CurrentContext(),
-) -> dict[str, Any]:
-    """Demonstrate MCP background task progress updates with TaskConfig."""
-    bounded_steps = max(1, min(steps, 50))
-    await progress.set_total(bounded_steps)
-    for i in range(bounded_steps):
-        await progress.set_message(f"Running step {i + 1}/{bounded_steps}")
-        await progress.increment()
-        await asyncio.sleep(0.05)
-
-    return {
-        "status": "completed",
-        "steps": bounded_steps,
-        "request_id": _ctx_optional(ctx, "request_id"),
-    }
-
-
-@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False})
-async def dependency_injection_snapshot(
-    runtime_mode: str = Depends(_di_runtime_mode),
-    headers: dict[str, str] = Depends(_di_http_headers),
-    helper_request_id: str | None = Depends(_di_request_id_from_context),
-    server_ref: FastMCP = CurrentFastMCP(),
-    ctx: Context = CurrentContext(),
-) -> dict[str, Any]:
-    """Show injected runtime values from custom and built-in FastMCP dependencies."""
-    header_names = list(headers.keys())
-    return {
-        "runtime_mode": runtime_mode,
-        "server_name": getattr(server_ref, "name", None),
-        "transport": _ctx_optional(ctx, "transport"),
-        "request_id": _ctx_optional(ctx, "request_id"),
-        "helper_request_id": helper_request_id,
-        "header_count": len(header_names),
-        "header_sample": header_names[:10],
-    }
-
-
-@mcp.tool(tags={"public"})
-async def elicitation_collect_maintenance_window(ctx: Context = CurrentContext()) -> dict[str, Any]:
-    """Collect maintenance window preferences via multi-turn user elicitation."""
-    await _context_safe_log(ctx, "info", "Starting maintenance window elicitation")
-
-    try:
-        window_result = await ctx.elicit(
-            "Choose the maintenance window.",
-            response_type={
-                "now": {"title": "Start Now"},
-                "offpeak": {"title": "Next Off-Peak Window"},
-            },
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "Client does not support elicitation. Use a client with elicitation handler support."
-        ) from exc
-
-    if window_result.action != "accept":
-        await _context_safe_log(ctx, "warning", "Maintenance window elicitation declined or cancelled")
-        return {"status": window_result.action, "message": "Maintenance scheduling aborted."}
-
-    duration_result = await ctx.elicit("Duration in minutes?", response_type=int)
-    if duration_result.action != "accept":
-        await _context_safe_log(ctx, "warning", "Maintenance duration elicitation declined or cancelled")
-        return {"status": duration_result.action, "message": "Maintenance scheduling aborted."}
-
-    tags_result = await ctx.elicit(
-        "Select maintenance tags.",
-        response_type=[{
-            "vacuum": {"title": "Vacuum"},
-            "reindex": {"title": "Reindex"},
-            "analyze": {"title": "Analyze"},
-        }],
-    )
-    if tags_result.action != "accept":
-        await _context_safe_log(ctx, "warning", "Maintenance tags elicitation declined or cancelled")
-        return {"status": tags_result.action, "message": "Maintenance scheduling aborted."}
-
-    approval_result = await ctx.elicit(
-        "Approve maintenance execution?",
-        response_type=None,
-    )
-    if approval_result.action != "accept":
-        await _context_safe_log(ctx, "warning", "Maintenance approval declined or cancelled")
-        return {"status": approval_result.action, "message": "Maintenance scheduling aborted before approval."}
-
-    await _context_safe_log(
-        ctx,
-        "info",
-        "Maintenance schedule collected",
-        {
-            "window": window_result.data,
-            "duration_minutes": duration_result.data,
-            "tags": tags_result.data,
-        },
-    )
-
-    return {
-        "status": "accepted",
-        "window": window_result.data,
-        "duration_minutes": duration_result.data,
-        "tags": tags_result.data,
-        "request_id": _ctx_optional(ctx, "request_id"),
-    }
-
-
-@mcp.tool(tags={"public"})
-async def elicitation_create_maintenance_ticket(ctx: Context = CurrentContext()) -> dict[str, Any]:
-    """Collect structured ticket metadata with a single elicitation form."""
-    await _context_safe_log(ctx, "info", "Starting structured maintenance ticket elicitation")
-    try:
-        result = await ctx.elicit(
-            message="Provide maintenance ticket details",
-            response_type=ElicitedMaintenanceTicket,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "Client does not support elicitation. Use a client with elicitation handler support."
-        ) from exc
-
-    if result.action != "accept":
-        await _context_safe_log(ctx, "warning", "Maintenance ticket elicitation declined or cancelled")
-        return {"status": result.action, "message": "Ticket creation aborted."}
-
-    ticket = result.data
-    await _context_safe_log(
-        ctx,
-        "info",
-        "Maintenance ticket collected",
-        {
-            "title": ticket.title,
-            "owner": ticket.owner,
-            "priority": ticket.priority,
-        },
-    )
-    return {
-        "status": "accepted",
-        "ticket": {
-            "title": ticket.title,
-            "owner": ticket.owner,
-            "priority": ticket.priority,
-        },
-        "request_id": _ctx_optional(ctx, "request_id"),
-    }
-
-
-@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": False, "openWorldHint": False})
-async def session_counter(reset: bool = False, ctx: Context = CurrentContext()) -> dict[str, Any]:
-    """Demonstrate FastMCP session state persistence scoped to the current session."""
-    key = "mcp_postgres_demo_counter"
-    if reset:
-        await _context_state_delete(ctx, key)
-        await _context_safe_log(ctx, "info", "Session counter reset")
-        return {
-            "status": "reset",
-            "counter": 0,
-            "session_id": _ctx_optional(ctx, "session_id"),
-            "request_id": _ctx_optional(ctx, "request_id"),
-        }
-
-    current = await _context_state_get(ctx, key)
-    try:
-        current_int = int(current) if current is not None else 0
-    except Exception:
-        current_int = 0
-
-    next_value = current_int + 1
-    await _context_state_set(ctx, key, next_value)
-    await _context_safe_log(
-        ctx,
-        "debug",
-        "Session counter incremented",
-        {"counter": next_value},
-    )
-    return {
-        "status": "ok",
-        "counter": next_value,
-        "session_id": _ctx_optional(ctx, "session_id"),
-        "request_id": _ctx_optional(ctx, "request_id"),
-    }
-
-
-@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False})
-async def logging_demo(level: Literal["debug", "info", "warning", "error"] = "info", ctx: Context = CurrentContext()) -> dict[str, Any]:
-    """Emit MCP client logs with structured metadata for logging pipeline validation."""
-    request_id = _ctx_optional(ctx, "request_id")
-    payload = {"operation": "logging_demo", "selected_level": level, "request_id": request_id}
-
-    await ctx.debug("Debug log from logging_demo", extra={**payload, "stage": "debug"})
-    await ctx.info("Info log from logging_demo", extra={**payload, "stage": "info"})
-    await ctx.warning("Warning log from logging_demo", extra={**payload, "stage": "warning"})
-
-    if level == "error":
-        await ctx.error("Error log from logging_demo", extra={**payload, "stage": "error"})
-
-    return {
-        "status": "ok",
-        "emitted": ["debug", "info", "warning"] + (["error"] if level == "error" else []),
-        "request_id": request_id,
-    }
-
-
-@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False})
-async def server_runtime_config_snapshot(ctx: Context = CurrentContext()) -> dict[str, Any]:
-    """Return a compact snapshot of FastMCP server/runtime configuration flags."""
-    server_ref = ctx.fastmcp
-    strict_input_validation = getattr(server_ref, "strict_input_validation", None)
-    include_tags = sorted(list(getattr(server_ref, "include_tags", set()) or []))
-    exclude_tags = sorted(list(getattr(server_ref, "exclude_tags", set()) or []))
-    tasks_default = getattr(server_ref, "_support_tasks_by_default", None)
-
-    return {
-        "server_name": getattr(server_ref, "name", None),
-        "version": getattr(server_ref, "version", None),
-        "transport": _ctx_optional(ctx, "transport"),
-        "request_id": _ctx_optional(ctx, "request_id"),
-        "tasks_default": tasks_default,
-        "strict_input_validation": strict_input_validation,
-        "include_tags": include_tags,
-        "exclude_tags": exclude_tags,
-        "list_page_size": list_page_size,
-        "mask_error_details_env": _env_optional_bool("MCP_MASK_ERROR_DETAILS"),
-    }
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -6090,19 +5656,6 @@ def main() -> None:
     
     stateless = _env_bool("MCP_STATELESS", False)
     json_resp = _env_bool("MCP_JSON_RESPONSE", False)
-
-    allow_legacy_sse = _env_optional_bool("MCP_ALLOW_LEGACY_SSE")
-    if allow_legacy_sse is None:
-        allow_legacy_sse = _env_optional_bool("FASTMCP_ALLOW_LEGACY_SSE")
-
-    if transport == "sse":
-        if allow_legacy_sse is False:
-            raise ValueError(
-                "Legacy SSE transport is disabled. Set MCP_TRANSPORT=http or set MCP_ALLOW_LEGACY_SSE=true."
-            )
-        logger.warning(
-            "MCP_TRANSPORT=sse is legacy compatibility mode. Use MCP_TRANSPORT=http for new deployments."
-        )
     
     # SSL Configuration for HTTPS
     ssl_cert = os.environ.get("MCP_SSL_CERT")
@@ -6212,6 +5765,8 @@ def main() -> None:
 # Background Task Versions of Analysis Tools
 # These run as async background tasks with progress reporting
 
+from fastmcp.dependencies import Progress
+
 
 @mcp.tool(tags={"public"}, task=True, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False})
 async def db_pg96_analyze_logical_data_model_async(
@@ -6238,17 +5793,7 @@ async def db_pg96_analyze_logical_data_model_async(
         Dictionary containing logical model, issues, and recommendations.
     """
     await progress.set_message("Starting data model analysis...")
-    await _context_safe_log(
-        ctx,
-        "info",
-        "db_pg96_analyze_logical_data_model_async started",
-        {
-            "schema": schema,
-            "include_views": include_views,
-            "max_entities": max_entities,
-            "detail_level": detail_level,
-        },
-    )
+    await _ctx_log(ctx, "info", f"Starting logical data model async analysis for schema={schema}")
     
     def _snake_case(name: str) -> bool:
         return bool(re.match(r"^[a-z][a-z0-9_]*$", name))
@@ -6266,6 +5811,7 @@ async def db_pg96_analyze_logical_data_model_async(
     with pool.connection() as conn:
         with conn.cursor() as cur:
             await progress.set_message("Fetching table metadata...")
+            await _ctx_log(ctx, "debug", "Fetching table metadata")
             _execute_safe(cur, "select now() at time zone 'utc' as generated_at_utc")
             generated_at_row = cur.fetchone() or {}
             generated_at = generated_at_row.get("generated_at_utc")
@@ -6295,19 +5841,11 @@ async def db_pg96_analyze_logical_data_model_async(
             total_tables = len(table_rows)
             table_rows = table_rows[:max_entities] if max_entities and max_entities > 0 else table_rows
             table_names = [r["name"] for r in table_rows]
-            await _context_safe_log(
-                ctx,
-                "info",
-                "db_pg96_analyze_logical_data_model_async metadata fetched",
-                {
-                    "total_tables": total_tables,
-                    "selected_tables": len(table_rows),
-                },
-            )
 
             await progress.set_total(4)
             await progress.set_message("Analyzing columns...")
             await progress.increment()
+            await _ctx_log(ctx, "debug", f"Columns phase started for {len(table_names)} entities")
 
             columns_by_table: dict[str, list[dict[str, Any]]] = {}
             if include_attributes and table_names:
@@ -6348,6 +5886,7 @@ async def db_pg96_analyze_logical_data_model_async(
 
             await progress.set_message("Analyzing constraints...")
             await progress.increment()
+            await _ctx_log(ctx, "debug", "Constraint analysis phase started")
 
             _execute_safe(
                 cur,
@@ -6380,6 +5919,7 @@ async def db_pg96_analyze_logical_data_model_async(
 
             await progress.set_message("Analyzing foreign keys...")
             await progress.increment()
+            await _ctx_log(ctx, "debug", "Foreign key analysis phase started")
 
             _execute_safe(
                 cur,
@@ -6415,6 +5955,7 @@ async def db_pg96_analyze_logical_data_model_async(
 
             await progress.set_message("Analyzing indexes...")
             await progress.increment()
+            await _ctx_log(ctx, "debug", "Index analysis phase started")
 
             _execute_safe(
                 cur,
@@ -6452,6 +5993,7 @@ async def db_pg96_analyze_logical_data_model_async(
 
             await progress.set_message("Compiling results...")
             await progress.increment()
+            await _ctx_log(ctx, "debug", "Compiling logical model results")
 
             entities: list[dict[str, Any]] = []
             for table_row in table_rows:
@@ -6524,6 +6066,7 @@ async def db_pg96_analyze_logical_data_model_async(
             await progress.set_message("Analysis complete")
             await progress.set_total(4)
             await progress.increment(4)
+            await _ctx_log(ctx, "info", f"Logical data model async analysis completed: entities={len(entities)} issues={len(issues)}")
 
             results = {
                 "schema": schema,
@@ -6535,28 +6078,8 @@ async def db_pg96_analyze_logical_data_model_async(
             }
 
             if response_format == "legacy":
-                await _context_safe_log(
-                    ctx,
-                    "info",
-                    "db_pg96_analyze_logical_data_model_async completed",
-                    {
-                        "entity_count": len(entities),
-                        "issues_count": len(issues),
-                        "response_format": response_format,
-                    },
-                )
                 return results
 
-            await _context_safe_log(
-                ctx,
-                "info",
-                "db_pg96_analyze_logical_data_model_async completed",
-                {
-                    "entity_count": len(entities),
-                    "issues_count": len(issues),
-                    "response_format": response_format,
-                },
-            )
             return _build_response_envelope(
                 tool="db_pg96_analyze_logical_data_model_async",
                 payload=results,
@@ -6592,16 +6115,7 @@ async def db_pg96_analyze_indexes_async(
     """
     await progress.set_message("Starting index analysis...")
     await progress.set_total(3)
-    await _context_safe_log(
-        ctx,
-        "info",
-        "db_pg96_analyze_indexes_async started",
-        {
-            "schema": schema,
-            "detail_level": detail_level,
-            "max_items_per_category": max_items_per_category,
-        },
-    )
+    await _ctx_log(ctx, "info", f"Starting index async analysis schema={schema or '*'}")
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -6630,12 +6144,7 @@ async def db_pg96_analyze_indexes_async(
 
             _execute_safe(cur, unused_query, {"schema": schema} if schema else None)
             unused_results = cur.fetchall()
-            await _context_safe_log(
-                ctx,
-                "debug",
-                "db_pg96_analyze_indexes_async unused indexes fetched",
-                {"unused_count": len(unused_results)},
-            )
+            await _ctx_log(ctx, "debug", f"Unused index rows fetched={len(unused_results)}")
 
             await progress.set_message("Checking for duplicate indexes...")
             await progress.increment()
@@ -6661,12 +6170,7 @@ async def db_pg96_analyze_indexes_async(
 
             _execute_safe(cur, dup_query, {"schema": schema} if schema else None)
             duplicate_results = cur.fetchall()
-            await _context_safe_log(
-                ctx,
-                "debug",
-                "db_pg96_analyze_indexes_async duplicate indexes fetched",
-                {"duplicate_count": len(duplicate_results)},
-            )
+            await _ctx_log(ctx, "debug", f"Duplicate index rows fetched={len(duplicate_results)}")
 
             await progress.set_message("Compiling results...")
             await progress.increment()
@@ -6681,18 +6185,6 @@ async def db_pg96_analyze_indexes_async(
 
             unused_trimmed = _trim(list(unused_results), list_cap)
             dup_trimmed = _trim(list(duplicate_results), list_cap)
-            truncated = len(unused_results) > list_cap or len(duplicate_results) > list_cap
-            await _context_safe_log(
-                ctx,
-                "debug",
-                "db_pg96_analyze_indexes_async trimming applied",
-                {
-                    "list_cap": list_cap,
-                    "truncated": truncated,
-                    "unused_returned": len(unused_trimmed),
-                    "duplicate_returned": len(dup_trimmed),
-                },
-            )
 
             results: dict[str, Any] = {
                 "unused_indexes": unused_trimmed,
@@ -6711,34 +6203,23 @@ async def db_pg96_analyze_indexes_async(
 
             await progress.set_message("Analysis complete")
             await progress.increment()
+            await _ctx_log(
+                ctx,
+                "info",
+                (
+                    "Index async analysis complete "
+                    f"unused={len(results['unused_indexes'])} duplicate={len(results['duplicate_indexes'])} "
+                    f"cap={list_cap}"
+                ),
+            )
 
             if response_format == "legacy":
                 results["_meta"] = {
                     "detail_level": detail_level,
                     "max_items_per_category": list_cap,
                 }
-                await _context_safe_log(
-                    ctx,
-                    "info",
-                    "db_pg96_analyze_indexes_async completed",
-                    {
-                        "response_format": response_format,
-                        "unused_count": len(results["unused_indexes"]),
-                        "duplicate_count": len(results["duplicate_indexes"]),
-                    },
-                )
                 return results
 
-            await _context_safe_log(
-                ctx,
-                "info",
-                "db_pg96_analyze_indexes_async completed",
-                {
-                    "response_format": response_format,
-                    "unused_count": len(results["unused_indexes"]),
-                    "duplicate_count": len(results["duplicate_indexes"]),
-                },
-            )
             return _build_response_envelope(
                 tool="db_pg96_analyze_indexes_async",
                 payload=results,
@@ -6898,24 +6379,9 @@ async def db_pg96_analyze_sessions_async(
     """
     await progress.set_message("Analyzing database sessions...")
     await progress.set_total(3)
-    request_id: str | None = None
-    try:
-        request_id = ctx.request_id
-    except Exception:
-        request_id = None
-    transport = os.environ.get("MCP_TRANSPORT", "http").strip().lower()
-    await _context_safe_log(
-        ctx,
-        "info",
-        "db_pg96_analyze_sessions_async started",
-        {
-            "request_id": request_id,
-            "transport": transport,
-            "include_idle": include_idle,
-            "include_active": include_active,
-            "include_locked": include_locked,
-        },
-    )
+    request_id = ctx.request_id if hasattr(ctx, "request_id") else "unknown"
+    transport = str(ctx.transport) if hasattr(ctx, "transport") else "unknown"
+    await _ctx_log(ctx, "info", f"Starting session async analysis request_id={request_id} transport={transport}")
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -7029,17 +6495,14 @@ async def db_pg96_analyze_sessions_async(
                 })
 
             await progress.set_message("Session analysis complete")
-            await _context_safe_log(
+            await _ctx_log(
                 ctx,
                 "info",
-                "db_pg96_analyze_sessions_async completed",
-                {
-                    "request_id": request_id,
-                    "transport": transport,
-                    "active_count": len(results["active_sessions"]),
-                    "idle_count": len(results["idle_sessions"]),
-                    "locked_count": len(results["locked_sessions"]),
-                },
+                (
+                    "Session async analysis complete "
+                    f"active={len(results['active_sessions'])} idle={len(results['idle_sessions'])} "
+                    f"locked={len(results['locked_sessions'])}"
+                ),
             )
 
             return results

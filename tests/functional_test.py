@@ -297,83 +297,47 @@ def _parse_resource_payload(raw_content: Any) -> dict[str, Any]:
 def test_resources_prompts_and_async_context_compat(db_pool):
     db_pool.open()
     try:
-        resources = asyncio.run(server_module.mcp.list_resources())
-        resource_uris = {str(resource.uri) for resource in resources}
+        resources_map = asyncio.run(server_module.mcp.get_resources())
+        resource_uris = {str(resource.key) for resource in resources_map.values()}
         assert "data://server/status" in resource_uris
-        assert "data://server/capabilities" in resource_uris
-        assert "data://composed/info" in resource_uris
 
-        resource_templates = asyncio.run(server_module.mcp.list_resource_templates())
-        template_uris = {
-            str(getattr(template, "uriTemplate", getattr(template, "uri_template", "")))
-            for template in resource_templates
-        }
+        template_map = asyncio.run(server_module.mcp.get_resource_templates())
+        template_uris = {str(t.key) for t in template_map.values()}
         assert "data://db/settings{?pattern,limit}" in template_uris
 
-        status_content = asyncio.run(server_module.mcp.read_resource("data://server/status"))
-        if isinstance(status_content, list):
-            assert len(status_content) >= 1
-            status_data = _parse_resource_payload(status_content[0].content)
-        else:
-            contents = getattr(status_content, "contents", [])
-            assert len(contents) >= 1
-            status_data = _parse_resource_payload(contents[0].content)
+        status_resource = asyncio.run(server_module.mcp.get_resource("data://server/status"))
+        status_data = _parse_resource_payload(asyncio.run(status_resource.read()))
         assert status_data.get("ok") is True
         assert "transport" in status_data
         assert "allow_write" in status_data
         assert "statement_timeout_ms" in status_data
         assert isinstance(status_data.get("database"), dict)
 
-        capabilities_content = asyncio.run(server_module.mcp.read_resource("data://server/capabilities"))
-        if isinstance(capabilities_content, list):
-            assert len(capabilities_content) >= 1
-            capabilities_data = _parse_resource_payload(capabilities_content[0].content)
-        else:
-            contents = getattr(capabilities_content, "contents", [])
-            assert len(contents) >= 1
-            capabilities_data = _parse_resource_payload(contents[0].content)
-        assert "resource_count" in capabilities_data
-        assert "prompt_count" in capabilities_data
+        settings_template = asyncio.run(server_module.mcp.get_resource_template("data://db/settings{?pattern,limit}"))
+        settings_data = _parse_resource_payload(
+            asyncio.run(settings_template.read({"pattern": "max_connections", "limit": 5}))
+        )
+        assert settings_data.get("count", 0) >= 1
+        assert isinstance(settings_data.get("settings"), list)
 
-        composed_info_content = asyncio.run(server_module.mcp.read_resource("data://composed/info"))
-        if isinstance(composed_info_content, list):
-            assert len(composed_info_content) >= 1
-            composed_info_data = _parse_resource_payload(composed_info_content[0].content)
-        else:
-            contents = getattr(composed_info_content, "contents", [])
-            assert len(contents) >= 1
-            composed_info_data = _parse_resource_payload(contents[0].content)
-        assert composed_info_data.get("component") == "composition_demo"
-
-        prompts = asyncio.run(server_module.mcp.list_prompts())
-        prompt_names = {prompt.name for prompt in prompts}
+        prompts_map = asyncio.run(server_module.mcp.get_prompts())
+        prompt_names = set(prompts_map.keys())
         assert "explain_slow_query" in prompt_names
         assert "maintenance_recommendations" in prompt_names
-        assert "runtime_context_brief" in prompt_names
 
+        explain_prompt = asyncio.run(server_module.mcp.get_prompt("explain_slow_query"))
         explain_result = asyncio.run(
-            server_module.mcp.render_prompt(
-                "explain_slow_query",
-                {"sql": "select 1", "analyze": "false", "buffers": "false"},
-            )
+            explain_prompt.render({"sql": "select 1", "analyze": "false", "buffers": "false"})
         )
-        explain_messages = explain_result.messages
+        explain_messages = explain_result if isinstance(explain_result, list) else explain_result.messages
         assert isinstance(explain_messages, list)
         assert len(explain_messages) >= 2
 
-        maintenance_result = asyncio.run(
-            server_module.mcp.render_prompt("maintenance_recommendations", {"profile": "oltp"})
-        )
-        maintenance_messages = maintenance_result.messages
+        maintenance_prompt = asyncio.run(server_module.mcp.get_prompt("maintenance_recommendations"))
+        maintenance_result = asyncio.run(maintenance_prompt.render({"profile": "oltp"}))
+        maintenance_messages = maintenance_result if isinstance(maintenance_result, list) else maintenance_result.messages
         assert isinstance(maintenance_messages, list)
         assert len(maintenance_messages) >= 1
-
-        runtime_context_result = asyncio.run(
-            server_module.mcp.render_prompt("runtime_context_brief", {"topic": "autovacuum tuning"})
-        )
-        runtime_context_messages = runtime_context_result.messages
-        assert isinstance(runtime_context_messages, list)
-        assert len(runtime_context_messages) >= 1
 
         for tool_name in (
             "db_pg96_analyze_logical_data_model_async",
@@ -386,17 +350,10 @@ def test_resources_prompts_and_async_context_compat(db_pool):
             assert "\"ctx\"" not in schema
 
         # Verify async tools are discoverable via MCP runtime API.
-        discovered_tools = {tool.name for tool in asyncio.run(server_module.mcp.list_tools())}
+        discovered_tools = set(asyncio.run(server_module.mcp.get_tools()).keys())
         assert "db_pg96_analyze_indexes_async" in discovered_tools
         assert "db_pg96_analyze_sessions_async" in discovered_tools
-        assert "task_progress_demo" in discovered_tools
-        assert "dependency_injection_snapshot" in discovered_tools
-        assert "elicitation_collect_maintenance_window" in discovered_tools
-        assert "elicitation_create_maintenance_ticket" in discovered_tools
-        assert "session_counter" in discovered_tools
-        assert "logging_demo" in discovered_tools
-        assert "server_runtime_config_snapshot" in discovered_tools
-        assert "composed_composition_ping" in discovered_tools
+        assert "db_pg96_analyze_logical_data_model_async" in discovered_tools
     finally:
         try:
             db_pool.close(timeout=15.0)

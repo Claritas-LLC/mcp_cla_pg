@@ -121,7 +121,7 @@ This server exposes read-only FastMCP resources for deterministic runtime and co
 - MIME type: `application/json`
 - Query args:
   - `pattern`: optional PostgreSQL regex (case-insensitive)
-  - `limit`: optional integer, bounded to `1..500`
+  - `limit`: optional integer, must be `> 0`
 - Payload shape:
 
 ```json
@@ -129,7 +129,7 @@ This server exposes read-only FastMCP resources for deterministic runtime and co
   "pattern": "max_connections|shared_buffers",
   "limit": 50,
   "count": 2,
-  "rows": [
+  "settings": [
     {
       "name": "max_connections",
       "setting": "100",
@@ -156,21 +156,15 @@ The following prompts are available for repeatable operational guidance.
   - `buffers: bool` (default `false`)
 - Output: deterministic message sequence with task metadata.
 
-Example rendered message payload:
+Example rendered prompt result shape:
 
 ```json
 {
-  "task": "explain_and_optimize",
-  "plan_mode": "ESTIMATE",
-  "buffers": "OFF",
-  "required_sections": [
-    "query_intent",
-    "plan_findings",
-    "index_recommendations",
-    "rewrite_recommendations",
-    "risk_assessment"
+  "messages": [
+    {"role": "user", "content": "You are a PostgreSQL performance analyst..."},
+    {"role": "user", "content": "Run db_pg96_explain_query with options..."}
   ],
-  "sql": "select * from orders where customer_id = 42"
+  "meta": {"prompt": "explain_slow_query", "deterministic": true}
 }
 ```
 
@@ -181,19 +175,15 @@ Example rendered message payload:
   - `profile: "oltp" | "olap"` (default `"oltp"`)
 - Output: `PromptResult` with one checklist message and metadata.
 
-Example rendered message payload:
+Example rendered prompt result shape:
 
 ```json
 {
-  "task": "maintenance_checklist",
-  "profile": "oltp",
-  "checklist": [
-    "Validate cache hit ratios against profile threshold.",
-    "Review checkpoint request ratio and WAL sizing.",
-    "Inspect dead tuples and vacuum/analyze recency.",
-    "Review long-running and idle-in-transaction sessions.",
-    "Tune connection pressure and autovacuum aggressiveness for OLTP churn."
-  ]
+  "messages": [
+    {"role": "user", "content": "Produce a deterministic PostgreSQL maintenance checklist..."},
+    {"role": "user", "content": "Use this order: security baseline, vacuum/analyze hygiene..."}
+  ],
+  "meta": {"prompt": "maintenance_recommendations", "profile": "oltp"}
 }
 ```
 
