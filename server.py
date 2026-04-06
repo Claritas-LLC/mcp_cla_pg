@@ -4826,37 +4826,17 @@ def db_pg96_list_objects(
     schema: str | None = None,
     owner: str | None = None,
     name_pattern: str | None = None,
+    limit: int = 100,
     order_by: str | None = None,
-    limit: int = 50,
-    detail_level: str = "full",
+    detail_level: str | None = None,
     max_items: int | None = None,
     response_format: str = "legacy",
 ) -> list[dict[str, Any]] | dict[str, Any]:
-    """
-    Consolidated tool to list database objects with filtering and sorting options.
-
-    Args:
-        object_type: Type of objects to list.
-                     Supported: 'database', 'schema', 'table', 'view', 'index', 'function', 'sequence', 'temp_object'.
-        schema: Filter by schema name.
-                For 'schema' type, it acts as an exact match filter.
-                For tables/views/etc., it filters by parent schema.
-        owner: Filter by object owner.
-        name_pattern: Filter object name by pattern (ILIKE).
-        order_by: Column to sort by. Defaults depend on object_type.
-                  Common options: 'name', 'size'.
-                  For tables: 'name', 'size', 'rows', 'dead_tuples', 'dead_ratio', 'vacuum', 'analyze'.
-                  For indexes: 'name', 'size', 'scans'.
-        limit: Maximum number of results (default: 50).
-
-    Returns:
-        List of objects with relevant details (name, schema, owner, size, stats, etc.).
-    """
     with pool.connection() as conn:
         with conn.cursor() as cur:
             params: dict[str, Any] = {"limit": limit}
             filters = []
-            
+
             # Helper for name filtering
             if name_pattern:
                 params['name_pattern'] = name_pattern
@@ -4880,17 +4860,14 @@ def db_pg96_list_objects(
                     FROM pg_database d
                     JOIN pg_roles r ON d.datdba = r.oid
                 """
+                # Exclude template databases by default (matches psql and most UIs)
+                filters.append("d.datistemplate = false")
                 if owner:
                     filters.append("r.rolname = %(owner)s")
                 if name_pattern:
                     filters.append("d.datname ILIKE %(name_pattern)s")
                 
                 sort_clause = "ORDER BY pg_database_size(d.datname) DESC"
-                if order_by == 'name':
-                    sort_clause = "ORDER BY d.datname"
-                elif order_by == 'size':
-                    sort_clause = "ORDER BY pg_database_size(d.datname) DESC"
-
             elif object_type == 'schema':
                 query = """
                     SELECT
@@ -4915,7 +4892,6 @@ def db_pg96_list_objects(
                 sort_clause = "ORDER BY n.nspname"
                 if order_by == 'size':
                     sort_clause = "ORDER BY sum(pg_total_relation_size(c.oid)) DESC"
-
             elif object_type == 'table':
                 # Comprehensive table query with stats
                 query = """
@@ -4965,7 +4941,6 @@ def db_pg96_list_objects(
                     sort_clause = "ORDER BY GREATEST(st.last_vacuum, st.last_autovacuum) DESC NULLS LAST"
                 elif order_by == 'analyze':
                     sort_clause = "ORDER BY GREATEST(st.last_analyze, st.last_autoanalyze) DESC NULLS LAST"
-
             elif object_type == 'index':
                 query = """
                     SELECT
@@ -5000,9 +4975,8 @@ def db_pg96_list_objects(
                     sort_clause = "ORDER BY pg_relation_size(c.oid) DESC"
                 elif order_by == 'scans' or order_by == 'usage':
                     sort_clause = "ORDER BY si.idx_scan DESC NULLS LAST"
-
             elif object_type == 'view':
-                 query = """
+                query = """
                     SELECT
                         n.nspname as schema,
                         c.relname as name,
@@ -5013,19 +4987,18 @@ def db_pg96_list_objects(
                     JOIN pg_namespace n ON c.relnamespace = n.oid
                     JOIN pg_roles r ON c.relowner = r.oid
                 """
-                 filters.append("c.relkind = 'v'")
-                 if name_pattern:
+                filters.append("c.relkind = 'v'")
+                if name_pattern:
                     filters.append("c.relname ILIKE %(name_pattern)s")
-                 if schema:
+                if schema:
                     filters.append("n.nspname = %(schema)s")
-                 else:
+                else:
                     filters.append("n.nspname NOT IN ('pg_catalog', 'information_schema')")
-                 if owner:
+                if owner:
                     filters.append("r.rolname = %(owner)s")
-                 sort_clause = "ORDER BY 1, 2"
-
+                sort_clause = "ORDER BY 1, 2"
             elif object_type == 'sequence':
-                 query = """
+                query = """
                     SELECT
                         n.nspname as schema,
                         c.relname as name,
@@ -5034,39 +5007,64 @@ def db_pg96_list_objects(
                     JOIN pg_namespace n ON c.relnamespace = n.oid
                     JOIN pg_roles r ON c.relowner = r.oid
                 """
-                 filters.append("c.relkind = 'S'")
-                 if name_pattern:
+                filters.append("c.relkind = 'S'")
+                if name_pattern:
                     filters.append("c.relname ILIKE %(name_pattern)s")
-                 if schema:
+                if schema:
                     filters.append("n.nspname = %(schema)s")
-                 else:
+                else:
                     filters.append("n.nspname NOT IN ('pg_catalog', 'information_schema')")
-                 if owner:
+                if owner:
                     filters.append("r.rolname = %(owner)s")
-                 sort_clause = "ORDER BY 1, 2"
-
+                sort_clause = "ORDER BY 1, 2"
             elif object_type == 'function':
-                     query = """
-                        SELECT
-                            n.nspname as schema,
-                            p.proname as name,
-                            pg_get_function_result(p.oid) as result_type,
-                            pg_get_function_arguments(p.oid) as arguments,
-                            r.rolname as owner
-                        FROM pg_proc p
-                        JOIN pg_namespace n ON p.pronamespace = n.oid
-                        JOIN pg_roles r ON p.proowner = r.oid
-                     """
-                     if name_pattern:
-                        filters.append("p.proname ILIKE %(name_pattern)s")
-                     if schema:
-                        filters.append("n.nspname = %(schema)s")
-                     else:
-                        filters.append("n.nspname NOT IN ('pg_catalog', 'information_schema')")
-                     if owner:
-                        filters.append("r.rolname = %(owner)s")
-                     
-                     sort_clause = "ORDER BY 1, 2"
+                query = """
+                    SELECT
+                        n.nspname as schema,
+                        p.proname as name,
+                        pg_get_function_result(p.oid) as result_type,
+                        pg_get_function_arguments(p.oid) as arguments,
+                        r.rolname as owner
+                    FROM pg_proc p
+                    JOIN pg_namespace n ON p.pronamespace = n.oid
+                    JOIN pg_roles r ON p.proowner = r.oid
+                """
+                if name_pattern:
+                    filters.append("p.proname ILIKE %(name_pattern)s")
+                if schema:
+                    filters.append("n.nspname = %(schema)s")
+                else:
+                    filters.append("n.nspname NOT IN ('pg_catalog', 'information_schema')")
+                if owner:
+                    filters.append("r.rolname = %(owner)s")
+                sort_clause = "ORDER BY 1, 2"
+            elif object_type == 'temp_object':
+                query = """
+                    SELECT
+                      n.nspname as schema,
+                      count(*) as object_count,
+                      pg_size_pretty(sum(pg_total_relation_size(c.oid))) as total_size
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                """
+                filters.append("n.nspname LIKE 'pg_temp%%'")
+                group_by = "GROUP BY n.nspname"
+                sort_clause = "ORDER BY sum(pg_total_relation_size(c.oid)) DESC"
+            else:
+                return [{"error": f"Unsupported object_type: {object_type}"}]
+
+            where_clause = "WHERE " + " AND ".join(filters) if filters else ""
+            full_sql = f"{query} {where_clause} {group_by} {sort_clause} LIMIT %(limit)s"
+            _execute_safe(cur, full_sql, params)
+            rows = cur.fetchall()
+
+            # DEBUG: Log the database names if object_type is 'database'
+            if object_type == 'database':
+                import logging
+                logging.basicConfig(level=logging.DEBUG)
+                db_names = [row.get('name') for row in rows]
+                logging.debug(f"db_pg96_list_objects: databases returned: {db_names}")
+
 
             elif object_type == 'temp_object':
                  query = """
@@ -5762,16 +5760,7 @@ def db_pg96_analyze_logical_data_model(
 
 @mcp.tool(tags={"public"}, annotations={"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}, timeout=60.0)
 def db_pg96_describe_table(schema: str, table: str) -> dict[str, Any]:
-    """
-    Get detailed information about a table's structure, including columns, indexes, and size.
 
-    Args:
-        schema: The schema the table belongs to.
-        table: The name of the table to describe.
-
-    Returns:
-        Dictionary containing schema, table name, columns, indexes, sizes, and approximate row count.
-    """
     with pool.connection() as conn:
         with conn.cursor() as cur:
             _execute_safe(
@@ -6531,61 +6520,9 @@ DATA_MODEL_HTML = """
                 </tr>
             `).join('');
 
-            // Generate Mermaid Diagram
-            const graph = generateMermaid(model);
-            renderMermaid(graph);
-        }
-
-        function generateMermaid(model) {
-            let s = 'erDiagram\\n';
-            
-            // Helper to sanitize names for Mermaid
-            const safeName = (name) => name.replace(/[^a-zA-Z0-9_]/g, '_');
-            const safeType = (type) => type.replace(/\\s+/g, '_');
-
-            // Entities
-            model.entities.forEach(e => {
-                const entityName = safeName(e.name);
-                s += `    ${entityName} {\n`;
-                // Add PKs first
-                e.attributes.forEach(a => {
-                    const isPk = e.primary_key.includes(a.name);
-                    const isFk = e.foreign_keys.some(fk => fk.local_columns.includes(a.name));
+            # [REMOVED: Embedded JavaScript code block that caused Python SyntaxError]
                     
-                    let type = safeType(a.data_type);
-                    if (a.max_length) type += `(${a.max_length})`;
-                    
-                    let markers = [];
-                    if (isPk) markers.push('PK');
-                    if (isFk) markers.push('FK');
-                    
-                    // Attribute name might need quotes if it has special chars, but for ERD
-                    // Mermaid expects word-like tokens. We'll use safeName just in case.
-                    s += `        ${type} ${safeName(a.name)} ${markers.length ? '"' + markers.join(', ') + '"' : ''}\n`;
-                });
-                s += '    }\\n';
-            });
-
-            // Relationships
-            model.relationships.forEach(r => {
-                // Determine cardinality (basic assumption for now: 1 to Many)
-                // If unique constraint exists on local columns, it might be 1 to 1
-                // For now, we use ||--o{ as default
-                const from = r.to_entity.split('.')[1]; // ref table (parent)
-                const to = r.from_entity.split('.')[1]; // local table (child)
-                
-                // Avoid self-references or missing entities crashing mermaid
-                if (from && to) {
-                    const label = r.name.replace(/"/g, "'"); // Escape quotes in label
-                    s += `    ${safeName(from)} ||--o{ ${safeName(to)} : "${label}"\n`;
-                }
-            });
-
-            return s;
-        }
-
-        window.onload = loadData;
-    </script>
+            # [REMOVED: Embedded JavaScript code block that caused Python SyntaxError]
 </body>
 </html>
 """
@@ -6626,174 +6563,260 @@ async def get_data_model_result(request: Request) -> JSONResponse:
         return JSONResponse({"error": f"Internal serialization error: {str(e)}"}, status_code=500)
 
 
-SESSION_MONITOR_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>DB Sessions Monitor</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body { font-family: sans-serif; padding: 20px; }
-        .container { max-width: 800px; margin: 0 auto; }
-        h1 { text-align: center; }
-        .stats { display: flex; justify-content: space-around; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-        .stat-box { text-align: center; padding: 10px; border: 1px solid #ddd; border-radius: 5px; min-width: 100px; }
-        .stat-value { font-size: 24px; font-weight: bold; }
-        .stat-label { color: #666; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>PostgreSQL Sessions Monitor</h1>
-        
-        <div class="stats">
-            <div class="stat-box">
-                <div id="activeVal" class="stat-value">-</div>
-                <div class="stat-label">Active</div>
+SESSION_MONITOR_HTML = (
+    """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>DB Sessions Monitor</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>
+            body { font-family: sans-serif; padding: 20px; }
+            .container { max-width: 800px; margin: 0 auto; }
+            h1 { text-align: center; }
+            .stats { display: flex; justify-content: space-around; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+            .stat-box { text-align: center; padding: 10px; border: 1px solid #ddd; border-radius: 5px; min-width: 100px; }
+            .stat-value { font-size: 24px; font-weight: bold; }
+            .stat-label { color: #666; }
+            #instance-badge { display: inline-block; margin: 10px auto 20px auto; padding: 4px 12px; border-radius: 8px; background: #e0e7ff; color: #3730a3; font-weight: bold; font-size: 16px; text-align: center; }
+            #error-message { color: #b91c1c; font-weight: bold; margin: 10px 0; text-align: center; display: none; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>PostgreSQL Sessions Monitor</h1>
+            <div id="instance-badge">Instance --</div>
+            <div id="error-message"></div>
+            <div class="stats">
+                <div class="stat-box">
+                    <div id="activeVal" class="stat-value">-</div>
+                    <div class="stat-label">Active</div>
+                </div>
+                <div class="stat-box">
+                    <div id="idleVal" class="stat-value">-</div>
+                    <div class="stat-label">Idle</div>
+                </div>
+                <div class="stat-box">
+                    <div id="idleTxnVal" class="stat-value">-</div>
+                    <div class="stat-label">Idle in TXN</div>
+                </div>
+                <div class="stat-box">
+                    <div id="totalVal" class="stat-value">-</div>
+                    <div class="stat-label">Total</div>
+                </div>
             </div>
-            <div class="stat-box">
-                <div id="idleVal" class="stat-value">-</div>
-                <div class="stat-label">Idle</div>
-            </div>
-            <div class="stat-box">
-                <div id="idleTxnVal" class="stat-value">-</div>
-                <div class="stat-label">Idle in TXN</div>
-            </div>
-            <div class="stat-box">
-                <div id="totalVal" class="stat-value">-</div>
-                <div class="stat-label">Total</div>
-            </div>
+            <canvas id="sessionsChart"></canvas>
         </div>
-
-        <canvas id="sessionsChart"></canvas>
-    </div>
-    <script>
-        const ctx = document.getElementById('sessionsChart').getContext('2d');
-        const chart = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: [],
-                datasets: [
-                    {
-                        label: 'Active',
-                        borderColor: 'rgb(75, 192, 192)',
-                        backgroundColor: 'rgba(75, 192, 192, 0.1)',
-                        data: [],
-                        tension: 0.1,
-                        fill: true
-                    },
-                    {
-                        label: 'Idle',
-                        borderColor: 'rgb(255, 205, 86)',
-                        backgroundColor: 'rgba(255, 205, 86, 0.1)',
-                        data: [],
-                        tension: 0.1,
-                        fill: true
-                    },
-                    {
-                        label: 'Idle in TXN',
-                        borderColor: 'rgb(255, 99, 132)',
-                        backgroundColor: 'rgba(255, 99, 132, 0.1)',
-                        data: [],
-                        tension: 0.1,
-                        fill: true
-                    },
-                    {
-                        label: 'Total',
-                        borderColor: 'rgb(54, 162, 235)',
-                        borderDash: [5, 5],
-                        data: [],
-                        tension: 0.1,
-                        fill: false
+        <script>
+            // Parse instance param from URL
+            function getInstanceParam() {
+                const params = new URLSearchParams(window.location.search);
+                let val = params.get('instance');
+                if (!val || (val !== '01' && val !== '02')) val = '01';
+                return val;
+            }
+            function setInstanceParam(val) {
+                const url = new URL(window.location.href);
+                url.searchParams.set('instance', val);
+                window.location.href = url.toString();
+            }
+            // Instance selector UI
+            const badge = document.getElementById('instance-badge');
+            // Add instance selector dropdown
+            const selector = document.createElement('select');
+            selector.id = 'instanceSelect';
+            selector.innerHTML = `<option value="01">01</option><option value="02">02</option>`;
+            selector.value = getInstanceParam();
+            selector.addEventListener('change', function() { setInstanceParam(this.value); });
+            badge.parentNode.insertBefore(selector, badge.nextSibling);
+            // Chart.js setup
+            const ctx = document.getElementById('sessionsChart').getContext('2d');
+            const chart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'Active',
+                            borderColor: 'rgb(75, 192, 192)',
+                            backgroundColor: 'rgba(75, 192, 192, 0.1)',
+                            data: [],
+                            tension: 0.1,
+                            fill: true
+                        },
+                        {
+                            label: 'Idle',
+                            borderColor: 'rgb(255, 205, 86)',
+                            backgroundColor: 'rgba(255, 205, 86, 0.1)',
+                            data: [],
+                            tension: 0.1,
+                            fill: true
+                        },
+                        {
+                            label: 'Idle in TXN',
+                            borderColor: 'rgb(255, 99, 132)',
+                            backgroundColor: 'rgba(255, 99, 132, 0.1)',
+                            data: [],
+                            tension: 0.1,
+                            fill: true
+                        },
+                        {
+                            label: 'Total',
+                            borderColor: 'rgb(54, 162, 235)',
+                            borderDash: [5, 5],
+                            data: [],
+                            tension: 0.1,
+                            fill: false
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        x: { title: { display: true, text: 'Time' } },
+                        y: { beginAtZero: true, title: { display: true, text: 'Count' } }
                     }
-                ]
-            },
-            options: {
-                responsive: true,
-                scales: {
-                    x: { title: { display: true, text: 'Time' } },
-                    y: { beginAtZero: true, title: { display: true, text: 'Count' } }
+                }
+            });
+            async function fetchData() {
+                const instance = getInstanceParam();
+                const errorDiv = document.getElementById('error-message');
+                try {
+                    const response = await fetch(`/api/sessions?instance=${instance}`);
+                    const data = await response.json();
+                    if (!response.ok) {
+                        errorDiv.style.display = 'block';
+                        errorDiv.textContent = data.error || 'Error fetching data';
+                        badge.textContent = 'Instance --';
+                        return;
+                    } else {
+                        errorDiv.style.display = 'none';
+                    }
+                    const now = new Date().toLocaleTimeString();
+                    document.getElementById('activeVal').textContent = data.active;
+                    document.getElementById('idleVal').textContent = data.idle;
+                    document.getElementById('idleTxnVal').textContent = data.idle_in_transaction;
+                    document.getElementById('totalVal').textContent = data.total;
+                    badge.textContent = `Instance ${data.instance_id} (${data.host}/${data.database})`;
+                    if (chart.data.labels.length > 20) {
+                        chart.data.labels.shift();
+                        chart.data.datasets[0].data.shift();
+                        chart.data.datasets[1].data.shift();
+                        chart.data.datasets[2].data.shift();
+                        chart.data.datasets[3].data.shift();
+                    }
+                    chart.data.labels.push(now);
+                    chart.data.datasets[0].data.push(data.active);
+                    chart.data.datasets[1].data.push(data.idle);
+                    chart.data.datasets[2].data.push(data.idle_in_transaction);
+                    chart.data.datasets[3].data.push(data.total);
+                    chart.update();
+                } catch (error) {
+                    errorDiv.style.display = 'block';
+                    errorDiv.textContent = 'Error fetching data';
+                    badge.textContent = 'Instance --';
                 }
             }
-        });
+            setInterval(fetchData, 5000);
+            fetchData();
+        </script>
+    </body>
+    </html>
+    """
+)
 
-        async function fetchData() {
-            try {
-                const response = await fetch('/api/sessions');
-                const data = await response.json();
-                const now = new Date().toLocaleTimeString();
-
-                // Update text stats
-                document.getElementById('activeVal').textContent = data.active;
-                document.getElementById('idleVal').textContent = data.idle;
-                document.getElementById('idleTxnVal').textContent = data.idle_in_transaction;
-                document.getElementById('totalVal').textContent = data.total;
-
-                // Update chart
-                if (chart.data.labels.length > 20) {
-                    chart.data.labels.shift();
-                    chart.data.datasets[0].data.shift();
-                    chart.data.datasets[1].data.shift();
-                    chart.data.datasets[2].data.shift();
-                    chart.data.datasets[3].data.shift();
-                }
-
-                chart.data.labels.push(now);
-                chart.data.datasets[0].data.push(data.active);
-                chart.data.datasets[1].data.push(data.idle);
-                chart.data.datasets[2].data.push(data.idle_in_transaction);
-                chart.data.datasets[3].data.push(data.total);
-                chart.update();
-            } catch (error) {
-                console.error('Error fetching data:', error);
-            }
-        }
-
-        // Fetch every 5 seconds
-        setInterval(fetchData, 5000);
-        fetchData(); // Initial fetch
-    </script>
-</body>
-</html>
-"""
 
 @mcp.custom_route("/sessions-monitor", methods=["GET"])
-async def sessions_monitor(_request: Request) -> HTMLResponse:
-    return HTMLResponse(SESSION_MONITOR_HTML)
+async def sessions_monitor(request: Request) -> HTMLResponse | JSONResponse:
+    # Get ?instance=01|02 from query params, default to 01
+    instance = request.query_params.get("instance", "01")
+    try:
+        normalized_instance = _normalize_instance_id(instance)
+    except Exception:
+        # Return JSON error for invalid instance param
+        return JSONResponse(
+            {"ok": False, "error": "Unsupported database instance id", "instance": instance},
+            status_code=400
+        )
+    # Inject instance badge and selector into HTML (unchanged)
+    html = SESSION_MONITOR_HTML.replace(
+        "<body>",
+        f"<body>\n<div style='position:fixed;top:10px;right:10px;z-index:1000;'>"
+        f"<form id='instanceForm' style='display:inline;'>"
+        f"<label for='instanceSelect'><b>Instance:</b></label> "
+        f"<select id='instanceSelect' name='instance'>"
+        f"<option value='01' {'selected' if normalized_instance=='01' else ''}>01</option>"
+        f"<option value='02' {'selected' if normalized_instance=='02' else ''}>02</option>"
+        f"</select>"
+        f"</form>"
+        f"<span style='margin-left:10px;padding:2px 8px;border-radius:6px;background:#e0e7ff;color:#3730a3;font-weight:bold;'>Instance {normalized_instance}</span>"
+        f"</div>"
+    )
+    # Add JS to handle instance selection (unchanged)
+    html = html.replace(
+        "</body>",
+        "<script>\n" +
+        "document.getElementById('instanceSelect').addEventListener('change', function() {\n" +
+        "  const val = this.value;\n" +
+        "  const url = new URL(window.location.href);\n" +
+        "  url.searchParams.set('instance', val);\n" +
+        "  window.location.href = url.toString();\n" +
+        "});\n" +
+        "</script>\n</body>"
+    )
+    # Patch JS fetch to include instance param (unchanged)
+    html = html.replace(
+        "fetch('/api/sessions');",
+        "fetch('/api/sessions?instance=" + normalized_instance + "');"
+    )
+    return HTMLResponse(html)
+
 
 @mcp.custom_route("/api/sessions", methods=["GET"])
-async def api_sessions(_request: Request) -> JSONResponse:
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            # Query for session counts
-            # Active: state = 'active'
-            # Idle: state = 'idle' only
-            # Idle in TXN: state in ('idle in transaction', 'idle in transaction (aborted)')
-            # Total: count(*)
-            _execute_safe(
-                cur,
-                """
-                SELECT
-                    sum(case when state = 'active' then 1 else 0 end) as active,
-                    sum(case when state = 'idle' then 1 else 0 end) as idle,
-                    sum(case when state in ('idle in transaction', 'idle in transaction (aborted)') then 1 else 0 end) as idle_in_transaction,
-                    count(*) as total
-                FROM pg_stat_activity
-                """
-            )
-            row = cur.fetchone()
-            active = row["active"] if row and row["active"] is not None else 0
-            idle = row["idle"] if row and row["idle"] is not None else 0
-            idle_in_transaction = row["idle_in_transaction"] if row and row["idle_in_transaction"] is not None else 0
-            total = row["total"] if row and row["total"] is not None else 0
-            
-            return JSONResponse({
-                "active": active,
-                "idle": idle,
-                "idle_in_transaction": idle_in_transaction,
-                "total": total,
-                "timestamp": time.time()
-            })
+async def api_sessions(request: Request) -> JSONResponse:
+    # Get ?instance=01|02 from query params, default to 01
+    instance = request.query_params.get("instance", "01")
+    try:
+        normalized_instance = _normalize_instance_id(instance)
+    except Exception:
+        return JSONResponse(
+            {"ok": False, "error": "Unsupported database instance id", "instance": instance},
+            status_code=400
+        )
+    def _query_fn():
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                _execute_safe(
+                    cur,
+                    """
+                    SELECT
+                        sum(case when state = 'active' then 1 else 0 end) as active,
+                        sum(case when state = 'idle' then 1 else 0 end) as idle,
+                        sum(case when state in ('idle in transaction', 'idle in transaction (aborted)') then 1 else 0 end) as idle_in_transaction,
+                        count(*) as total
+                    FROM pg_stat_activity
+                    """
+                )
+                row = cur.fetchone()
+                return row
+
+    row = _run_in_instance_sync(normalized_instance, _query_fn)
+    active = row["active"] if row and row["active"] is not None else 0
+    idle = row["idle"] if row and row["idle"] is not None else 0
+    idle_in_transaction = row["idle_in_transaction"] if row and row["idle_in_transaction"] is not None else 0
+    total = row["total"] if row and row["total"] is not None else 0
+    # Add instance metadata
+    meta = _resolve_instance_metadata(normalized_instance)
+    return JSONResponse({
+        "active": active,
+        "idle": idle,
+        "idle_in_transaction": idle_in_transaction,
+        "total": total,
+        "timestamp": time.time(),
+        "instance_id": meta.get("id"),
+        "host": meta.get("host"),
+        "database": meta.get("name"),
+    })
 
 async def health_check(_request: Request) -> JSONResponse:
     return JSONResponse({"status": "healthy"})
