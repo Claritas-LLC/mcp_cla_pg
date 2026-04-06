@@ -1,3 +1,4 @@
+
 import asyncio
 import itertools
 import importlib
@@ -43,6 +44,27 @@ class InstanceToolPrefixTransform(ToolTransform):
         # Otherwise, delegate to the next transform
         return await call_next(name, version=version)
 
+# --- Context-Aware Tool Prefix Transform ---
+class InstanceContextToolPrefixTransform(ToolTransform):
+    """
+    Automatically rewrites tool names to the correct instance prefix (pg96_ or pg14_)
+    based on the current per-request instance context variable (_ACTIVE_DB_INSTANCE).
+    This allows callers to select instance 2 and have all tool calls automatically
+    routed to the pg14_ namespace without manual prefixing.
+    """
+    def __init__(self, get_instance_id: Callable[[], str]):
+        self.get_instance_id = get_instance_id
+
+    async def get_tool(self, name: str, call_next, *, version=None):
+        # If already prefixed, pass through unchanged
+        if name.startswith("pg96_") or name.startswith("pg14_"):
+            return await call_next(name, version=version)
+        instance_id = self.get_instance_id()
+        if instance_id == "02":
+            return await call_next(f"pg14_{name}", version=version)
+        # Default to instance 1
+        return await call_next(f"pg96_{name}", version=version)
+
 # --- Transform Provider for Dual-Instance Routing ---
 def get_dual_instance_transforms(enable_dual: bool) -> list[Transform]:
     """
@@ -51,11 +73,11 @@ def get_dual_instance_transforms(enable_dual: bool) -> list[Transform]:
     """
     if not enable_dual:
         return []
-    # Example: Prefix all tools with 'pg96_' or 'pg14_' based on instance
-    # Here, we only implement 'pg96_' for demonstration; extend as needed.
+    # Add context-aware transform first, then the prefix transforms
     return [
+        InstanceContextToolPrefixTransform(lambda: _ACTIVE_DB_INSTANCE.get()),
         InstanceToolPrefixTransform("pg96_", lambda n: True),
-        # Add InstanceToolPrefixTransform("pg14_", ...) for other instance if needed
+        InstanceToolPrefixTransform("pg14_", lambda n: True),
     ]
 
 # --- MCP Server Initialization with Transform Wiring ---
@@ -560,21 +582,28 @@ def _resolve_skills_roots() -> list[str]:
     return resolved
 
 
-def _resolve_provider_skills_roots() -> list[str]:
-    raw = _env_optional_string("MCP_SKILLS_DIRS") or _env_optional_string("FASTMCP_SKILLS_DIRS")
-    if raw:
-        candidates = [segment.strip() for segment in re.split(r"[;,]", raw) if segment.strip()]
-    else:
-        candidates = [
-            os.path.join(os.getcwd(), ".trae", "skills"),
-            os.path.join(os.path.expanduser("~"), ".copilot", "skills"),
-        ]
+def _resolve_provider_skills_roots() -> list[str] | None:
+    """Return resolved skill roots.
 
+    Returns:
+        None  – when no MCP_SKILLS_DIRS/FASTMCP_SKILLS_DIRS is configured (caller should fall
+                back to CopilotSkillsProvider).
+        []    – when a path was explicitly configured but no valid directories were found
+                (caller should fail-closed, not fall back to CopilotSkillsProvider).
+        [...]  – one or more resolved valid directory paths.
+    """
+    raw = _env_optional_string("MCP_SKILLS_DIRS") or _env_optional_string("FASTMCP_SKILLS_DIRS")
+    if not raw:
+        # No configuration provided – signal caller to use CopilotSkillsProvider.
+        return None
+
+    candidates = [segment.strip() for segment in re.split(r"[;,]", raw) if segment.strip()]
     resolved: list[str] = []
     for candidate in candidates:
         full = os.path.abspath(os.path.expanduser(candidate))
         if os.path.isdir(full) and full not in resolved:
             resolved.append(full)
+    # Configuration was present but may have resolved to an empty list.
     return resolved
 
 
@@ -598,7 +627,30 @@ def _register_fastmcp_skills_provider() -> bool:
     roots = _resolve_provider_skills_roots()
 
     registered_count = 0
-    if roots:
+    if roots is None:
+        # No MCP_SKILLS_DIRS/FASTMCP_SKILLS_DIRS configured – fall back to CopilotSkillsProvider.
+        try:
+            provider = CopilotSkillsProvider(
+                reload=reload_enabled,
+                supporting_files=supporting_files_mode,
+            )
+            mcp.add_provider(provider)
+            registered_count = 1
+        except Exception as exc:
+            logger.warning("Failed to register CopilotSkillsProvider: %s", exc)
+    elif roots == []:
+        # Configuration was provided but resolved to no valid directories – fail-closed.
+        configured_paths = (
+            os.environ.get("MCP_SKILLS_DIRS") or os.environ.get("FASTMCP_SKILLS_DIRS") or ""
+        )
+        logger.error(
+            "FastMCP skills provider: MCP_SKILLS_DIRS/FASTMCP_SKILLS_DIRS was configured (%r) "
+            "but no valid directories were found. Refusing to fall back to CopilotSkillsProvider "
+            "(fail-closed). Fix the configured path(s) or unset the environment variable.",
+            configured_paths,
+        )
+        return False
+    else:
         try:
             provider = SkillsDirectoryProvider(
                 roots=roots,
@@ -626,16 +678,6 @@ def _register_fastmcp_skills_provider() -> bool:
                     registered_count += 1
                 except Exception as root_exc:
                     logger.warning("Skipping unreadable skills root '%s': %s", root, root_exc)
-    else:
-        try:
-            provider = CopilotSkillsProvider(
-                reload=reload_enabled,
-                supporting_files=supporting_files_mode,
-            )
-            mcp.add_provider(provider)
-            registered_count = 1
-        except Exception as exc:
-            logger.warning("Failed to register CopilotSkillsProvider: %s", exc)
 
     if registered_count == 0:
         logger.warning("FastMCP skills provider enabled but no providers could be registered.")
@@ -1636,8 +1678,27 @@ if SSH_HOST and SSH_USER:
             userinfo += '@'
         new_netloc = f"{userinfo}127.0.0.1:{_ssh_tunnel.local_bind_port}"
         DATABASE_URL = urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
-        
+
         logger.info("Updated DATABASE_URL to use SSH tunnel.")
+
+        # Also rewrite DATABASE_URL_INSTANCE_2 if it shares the same remote host:port
+        if DATABASE_URL_INSTANCE_2:
+            try:
+                parts2 = urlsplit(DATABASE_URL_INSTANCE_2)
+                if parts2.hostname == remote_bind_host and (parts2.port or 5432) == remote_bind_port:
+                    userinfo2 = ''
+                    if parts2.username:
+                        userinfo2 = parts2.username
+                        if parts2.password:
+                            userinfo2 += f":{quote(parts2.password)}"
+                        userinfo2 += '@'
+                    new_netloc2 = f"{userinfo2}127.0.0.1:{_ssh_tunnel.local_bind_port}"
+                    DATABASE_URL_INSTANCE_2 = urlunsplit(
+                        (parts2.scheme, new_netloc2, parts2.path, parts2.query, parts2.fragment)
+                    )
+                    logger.info("Updated DATABASE_URL_INSTANCE_2 to use SSH tunnel.")
+            except Exception as e2:
+                logger.warning("Could not rewrite DATABASE_URL_INSTANCE_2 for SSH tunnel: %s", e2)
         
     except Exception as e:
         logger.error(f"Failed to establish SSH tunnel: {e}")
@@ -1714,10 +1775,19 @@ def _resolve_pool_for_instance(instance_id: str) -> ConnectionPool[Any]:
 
 
 class _PoolRouter:
-    """Connection pool router that resolves target pool from per-request instance context."""
+    """Connection pool router that resolves target pool from per-request instance context, supporting dual-instance tool prefix routing."""
 
     def connection(self, *args: Any, **kwargs: Any):
-        return _resolve_pool_for_instance(_ACTIVE_DB_INSTANCE.get()).connection(*args, **kwargs)
+        # Check for dual-instance tool prefix in the current context
+        tool_name = kwargs.get('tool_name') or ''
+        if tool_name.startswith('pg14_'):
+            if pool_instance_02 is None:
+                raise RuntimeError(
+                    "Database instance 2 is not configured. Set DATABASE_URL_INSTANCE_2 in your environment."
+                )
+            return pool_instance_02.connection(*args, **kwargs)
+        # Default: use instance 1
+        return pool_instance_01.connection(*args, **kwargs)
 
     def close(self, *args: Any, **kwargs: Any) -> None:
         closed: set[int] = set()
@@ -1841,7 +1911,10 @@ def _validate_table_scope() -> None:
     )
 
 
-_validate_table_scope()
+# Validate table scope for each configured instance at startup.
+_validate_table_scope()  # validates instance "01" (default context)
+if pool_instance_02 is not None:
+    _run_in_instance_sync("02", _validate_table_scope)
 
 
 class _QueryRateCircuitBreaker:
@@ -5946,6 +6019,7 @@ def db_pg96_create_virtual_indexes(schema_name: str, sql_statement: str) -> dict
                 for candidate_set in candidate_sets:
                     _execute_safe(cur, "select * from hypopg_reset()")
                     created_indexes: list[dict[str, Any]] = []
+                    candidate_set_failed = False
 
                     for spec in candidate_set:
                         ddl = sql.SQL("CREATE INDEX ON {}.{} ({})").format(
@@ -5953,21 +6027,33 @@ def db_pg96_create_virtual_indexes(schema_name: str, sql_statement: str) -> dict
                             sql.Identifier(spec["table"]),
                             sql.SQL(", ").join(sql.Identifier(col) for col in spec["columns"]),
                         ).as_string(conn)
-                        _execute_safe(
-                            cur,
-                            "select * from hypopg_create_index(%(ddl)s)",
-                            {"ddl": ddl},
-                        )
-                        create_row = cur.fetchone() or {}
-                        created_indexes.append(
-                            {
-                                "schema": spec["schema"],
-                                "table": spec["table"],
-                                "columns": spec["columns"],
-                                "ddl": ddl,
-                                "hypopg_index_oid": create_row.get("indexrelid") or create_row.get("oid"),
-                            }
-                        )
+                        try:
+                            _execute_safe(
+                                cur,
+                                "select * from hypopg_create_index(%(ddl)s)",
+                                {"ddl": ddl},
+                            )
+                            create_row = cur.fetchone() or {}
+                            if create_row:
+                                created_indexes.append(
+                                    {
+                                        "schema": spec["schema"],
+                                        "table": spec["table"],
+                                        "columns": spec["columns"],
+                                        "ddl": ddl,
+                                        "hypopg_index_oid": create_row.get("indexrelid") or create_row.get("oid"),
+                                    }
+                                )
+                        except Exception as hypo_exc:
+                            logger.warning(
+                                "Skipping invalid hypothetical index spec %r: %s", ddl, hypo_exc
+                            )
+                            candidate_set_failed = True
+                            break
+
+                    if candidate_set_failed:
+                        _execute_safe(cur, "select * from hypopg_reset()")
+                        continue
 
                     _execute_safe(cur, explain_stmt)
                     rows = cur.fetchall()
