@@ -2216,6 +2216,24 @@ def _rollback_cursor_connection(cur) -> None:
         logger.debug(f"Rollback after query error failed: {rollback_error}")
 
 
+def _extract_db_error_message(error: Exception) -> str:
+    """Return a stable and non-empty database error message for client-safe surfacing."""
+    diag = getattr(error, "diag", None)
+    primary = getattr(diag, "message_primary", None) if diag is not None else None
+    if isinstance(primary, str) and primary.strip():
+        return primary.strip()
+
+    pgerror = getattr(error, "pgerror", None)
+    if isinstance(pgerror, str) and pgerror.strip():
+        return pgerror.strip()
+
+    text = str(error).strip()
+    if text:
+        return text
+
+    return error.__class__.__name__
+
+
 def _execute_safe(cur, sql: Any, params: Any = None) -> None:
     """Executes a query with session-level timeouts and sanitized error handling."""
     try:
@@ -2232,12 +2250,13 @@ def _execute_safe(cur, sql: Any, params: Any = None) -> None:
         cur.execute(sql, params)
     except PsycopgError as e:
         _rollback_cursor_connection(cur)
-        logger.error(f"Database error: {str(e)}")
+        db_error_message = _extract_db_error_message(e)
+        logger.error(f"Database error: {db_error_message}")
         # Sanitize error message to prevent leaking schema details
         # We only return the main error message if it's safe or a generic one
-        if "timeout" in str(e).lower():
+        if "timeout" in db_error_message.lower() or "canceling statement due to statement timeout" in db_error_message.lower():
             raise RuntimeError("Query execution timed out.") from e
-        raise RuntimeError(f"Database operation failed: {e.diag.message_primary if hasattr(e, 'diag') and e.diag else 'Internal error'}") from e
+        raise RuntimeError(f"Database operation failed: {db_error_message}") from e
     except Exception as e:
         _rollback_cursor_connection(cur)
         logger.exception("Unexpected error during query execution")
@@ -2268,10 +2287,11 @@ async def _execute_safe_async(cur, sql: Any, params: Any = None) -> None:
         await cur.execute(sql, params)
     except PsycopgError as e:
         await _rollback_cursor_connection_async(cur)
-        logger.error(f"Database error: {str(e)}")
-        if "timeout" in str(e).lower():
+        db_error_message = _extract_db_error_message(e)
+        logger.error(f"Database error: {db_error_message}")
+        if "timeout" in db_error_message.lower() or "canceling statement due to statement timeout" in db_error_message.lower():
             raise RuntimeError("Query execution timed out.") from e
-        raise RuntimeError(f"Database operation failed: {e.diag.message_primary if hasattr(e, 'diag') and e.diag else 'Internal error'}") from e
+        raise RuntimeError(f"Database operation failed: {db_error_message}") from e
     except Exception as e:
         await _rollback_cursor_connection_async(cur)
         logger.exception("Unexpected error during query execution")
