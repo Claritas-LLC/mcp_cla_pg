@@ -5,6 +5,7 @@ import sys
 import time
 import traceback
 import ast
+import json
 from typing import Any, cast
 
 import pytest
@@ -244,6 +245,118 @@ def test_legacy_skills_resources_still_register() -> None:
     assert "def _register_skills_resources()" in src
     assert "skills://index" in src
     assert "skills://{skill_id}" in src
+
+
+def test_sessions_list_route_and_sql_projection_present() -> None:
+    with open(SERVER_FILE, "r", encoding="utf-8") as f:
+        src = f.read()
+
+    assert '@mcp.custom_route("/api/sessions/list", methods=["GET"])' in src
+    assert "datname AS database_name" in src
+    assert "usename AS username" in src
+    assert "client_addr::text AS client_address" in src
+    assert "backend_start AS session_start" in src
+    assert "ORDER BY backend_start DESC NULLS LAST, pid DESC" in src
+
+
+def test_sessions_monitor_table_headers_present() -> None:
+    with open(SERVER_FILE, "r", encoding="utf-8") as f:
+        src = f.read()
+
+    expected_headers = [
+        "<th>PID</th>",
+        "<th>database name</th>",
+        "<th>username</th>",
+        "<th>application name</th>",
+        "<th>client address</th>",
+        "<th>client hostname</th>",
+        "<th>session start</th>",
+        "<th>wait event</th>",
+        "<th>state</th>",
+        "<th>query</th>",
+    ]
+    for header in expected_headers:
+        assert header in src
+    assert 'id="sessionsTableBody"' in src
+    assert "renderSessionsTable(sessionsPayload.sessions);" in src
+
+
+def test_api_sessions_list_route_returns_payload_shape(monkeypatch) -> None:
+    os.environ["DATABASE_URL"] = f"postgresql://{USER}:{PASSWORD}@{HOST}:{PORT}/{DB}"
+    os.environ["MCP_ALLOW_WRITE"] = "false"
+    os.environ["MCP_SKIP_CONFIRMATION"] = "true"
+    os.environ["MCP_REGISTER_SIGNAL_HANDLERS"] = "false"
+
+    if "server" in sys.modules:
+        del sys.modules["server"]
+    sys.path.insert(0, ROOT)
+    import server  # noqa: E402
+    sys.path.pop(0)
+
+    sample_sessions = [
+        {
+            "pid": 12345,
+            "database_name": "mcp_test",
+            "username": "postgres",
+            "application_name": "psql",
+            "client_address": "127.0.0.1",
+            "client_hostname": None,
+            "session_start": "2026-04-07T10:45:00",
+            "wait_event": "ClientRead",
+            "state": "idle",
+            "query": "SELECT 1",
+        }
+    ]
+
+    class _SessionsCursor(_FakeCursor):
+        def fetchall(self):
+            if "from pg_stat_activity" in self._last_query:
+                return sample_sessions
+            return []
+
+    class _SessionsConnection(_FakeConnection):
+        def cursor(self):
+            return _SessionsCursor()
+
+    class _SessionsPool(_FakePool):
+        def connection(self):
+            return _SessionsConnection()
+
+    monkeypatch.setattr(server, "pool", _SessionsPool())
+    monkeypatch.setattr(server, "_run_in_instance_sync", lambda instance_id, target, *args, **kwargs: target(*args, **kwargs))
+    monkeypatch.setattr(server, "_resolve_instance_metadata", lambda instance=None: {"id": "01", "host": "db01", "name": "mcp_test"})
+
+    request = type("Req", (), {"query_params": {"instance": "01"}})()
+    response = asyncio.run(server.api_sessions_list(request))
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload["instance_id"] == "01"
+    assert payload["host"] == "db01"
+    assert payload["database"] == "mcp_test"
+    assert payload["count"] == 1
+    assert payload["sessions"] == sample_sessions
+    assert isinstance(payload["timestamp"], float)
+
+
+def test_api_sessions_list_route_rejects_invalid_instance() -> None:
+    os.environ["DATABASE_URL"] = f"postgresql://{USER}:{PASSWORD}@{HOST}:{PORT}/{DB}"
+    os.environ["MCP_ALLOW_WRITE"] = "false"
+    os.environ["MCP_SKIP_CONFIRMATION"] = "true"
+    os.environ["MCP_REGISTER_SIGNAL_HANDLERS"] = "false"
+
+    if "server" in sys.modules:
+        del sys.modules["server"]
+    sys.path.insert(0, ROOT)
+    import server  # noqa: E402
+    sys.path.pop(0)
+
+    request = type("Req", (), {"query_params": {"instance": "03"}})()
+    response = asyncio.run(server.api_sessions_list(request))
+    payload = json.loads(response.body)
+
+    assert response.status_code == 400
+    assert payload == {"ok": False, "error": "Unsupported database instance id", "instance": "03"}
 
 
 def test_static_tools_inventory_phase4() -> None:

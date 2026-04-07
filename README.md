@@ -12,7 +12,9 @@ The real-time session monitor now supports explicit instance selection for envir
 
 - **Monitor URL:** `/sessions-monitor?instance=01|02` (defaults to `01`)
 - **API URL:** `/api/sessions?instance=01|02` (defaults to `01`)
+- **Session List API URL:** `/api/sessions/list?instance=01|02` (defaults to `01`)
 - **UI:** The monitor page includes an instance selector and badge. Changing the instance updates the stats and chart in real time.
+- **UI Session Table:** The monitor page also shows per-session rows with columns: `PID`, `database name`, `username`, `application name`, `client address`, `client hostname`, `session start`, `wait event`, `state`, `query`.
 - **Backend:** All session stats are routed to the correct instance using the dual-instance context and connection pools.
 
 **Example:**
@@ -26,6 +28,29 @@ http://localhost:8000/sessions-monitor?instance=02
 ```
 GET /api/sessions?instance=02
 Response: { "active": 3, "idle": 5, "idle_in_transaction": 0, "total": 8, "timestamp": 1712428800.0, "instance": "02" }
+
+GET /api/sessions/list?instance=02
+Response: {
+  "instance_id": "02",
+  "host": "10.100.2.21",
+  "database": "lenexa",
+  "count": 2,
+  "sessions": [
+    {
+      "pid": 12345,
+      "database_name": "lenexa",
+      "username": "postgres",
+      "application_name": "psql",
+      "client_address": "10.0.0.12",
+      "client_hostname": "-",
+      "session_start": "2026-04-07 10:45:00",
+      "wait_event": "ClientRead",
+      "state": "idle",
+      "query": "SELECT 1"
+    }
+  ],
+  "timestamp": 1712428800.0
+}
 ```
 
 If the `instance` parameter is omitted, instance `01` is used by default. The UI always displays the active instance.

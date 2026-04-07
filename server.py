@@ -6571,21 +6571,48 @@ SESSION_MONITOR_HTML = (
         <title>DB Sessions Monitor</title>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
-            body { font-family: sans-serif; padding: 20px; }
-            .container { max-width: 800px; margin: 0 auto; }
-            h1 { text-align: center; }
+            body { font-family: sans-serif; padding: 20px; background: #f8fafc; color: #0f172a; }
+            .container { max-width: 1400px; margin: 0 auto; }
+            h1 { text-align: center; margin-bottom: 10px; }
+            .toolbar { display: flex; justify-content: center; align-items: center; gap: 12px; margin: 10px 0 20px 0; flex-wrap: wrap; }
+            .toolbar label { font-weight: bold; }
+            .toolbar select { padding: 6px 10px; border-radius: 6px; border: 1px solid #cbd5e1; background: #fff; }
             .stats { display: flex; justify-content: space-around; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-            .stat-box { text-align: center; padding: 10px; border: 1px solid #ddd; border-radius: 5px; min-width: 100px; }
+            .stat-box { text-align: center; padding: 10px; border: 1px solid #ddd; border-radius: 5px; min-width: 100px; background: #fff; }
             .stat-value { font-size: 24px; font-weight: bold; }
             .stat-label { color: #666; }
-            #instance-badge { display: inline-block; margin: 10px auto 20px auto; padding: 4px 12px; border-radius: 8px; background: #e0e7ff; color: #3730a3; font-weight: bold; font-size: 16px; text-align: center; }
+            #instance-badge { display: inline-block; padding: 4px 12px; border-radius: 8px; background: #e0e7ff; color: #3730a3; font-weight: bold; font-size: 16px; text-align: center; }
             #error-message { color: #b91c1c; font-weight: bold; margin: 10px 0; text-align: center; display: none; }
+            .chart-panel { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06); }
+            .table-panel { margin-top: 24px; background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06); overflow: hidden; }
+            .table-header { padding: 16px; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+            .table-header h2 { margin: 0; font-size: 18px; }
+            .table-meta { color: #475569; font-size: 14px; }
+            .table-wrapper { overflow-x: auto; }
+            table { width: 100%; border-collapse: collapse; }
+            th, td { padding: 10px 12px; border-bottom: 1px solid #e2e8f0; text-align: left; vertical-align: top; font-size: 14px; }
+            th { background: #f8fafc; font-weight: 700; white-space: nowrap; }
+            tbody tr:nth-child(even) { background: #f8fafc; }
+            .query-cell { min-width: 320px; max-width: 560px; white-space: pre-wrap; word-break: break-word; font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+            .empty-state { text-align: center; color: #64748b; font-style: italic; padding: 20px; }
+            @media (max-width: 900px) {
+                body { padding: 12px; }
+                .container { max-width: 100%; }
+                .query-cell { min-width: 240px; max-width: 360px; }
+            }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>PostgreSQL Sessions Monitor</h1>
-            <div id="instance-badge">Instance --</div>
+            <div class="toolbar">
+                <label for="instanceSelect">Instance:</label>
+                <select id="instanceSelect" name="instance">
+                    <option value="01">01</option>
+                    <option value="02">02</option>
+                </select>
+                <div id="instance-badge">Instance --</div>
+            </div>
             <div id="error-message"></div>
             <div class="stats">
                 <div class="stat-box">
@@ -6605,7 +6632,38 @@ SESSION_MONITOR_HTML = (
                     <div class="stat-label">Total</div>
                 </div>
             </div>
-            <canvas id="sessionsChart"></canvas>
+            <div class="chart-panel">
+                <canvas id="sessionsChart"></canvas>
+            </div>
+            <section class="table-panel">
+                <div class="table-header">
+                    <h2>DB Sessions</h2>
+                    <div id="sessionsTableMeta" class="table-meta">Loading sessions...</div>
+                </div>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>PID</th>
+                                <th>database name</th>
+                                <th>username</th>
+                                <th>application name</th>
+                                <th>client address</th>
+                                <th>client hostname</th>
+                                <th>session start</th>
+                                <th>wait event</th>
+                                <th>state</th>
+                                <th>query</th>
+                            </tr>
+                        </thead>
+                        <tbody id="sessionsTableBody">
+                            <tr>
+                                <td class="empty-state" colspan="10">Loading sessions...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
         </div>
         <script>
             // Parse instance param from URL
@@ -6620,15 +6678,59 @@ SESSION_MONITOR_HTML = (
                 url.searchParams.set('instance', val);
                 window.location.href = url.toString();
             }
-            // Instance selector UI
             const badge = document.getElementById('instance-badge');
-            // Add instance selector dropdown
-            const selector = document.createElement('select');
-            selector.id = 'instanceSelect';
-            selector.innerHTML = `<option value="01">01</option><option value="02">02</option>`;
+            const selector = document.getElementById('instanceSelect');
+            const sessionsTableBody = document.getElementById('sessionsTableBody');
+            const sessionsTableMeta = document.getElementById('sessionsTableMeta');
+
+            function formatCellValue(value) {
+                if (value === null || value === undefined || value === '') {
+                    return '-';
+                }
+                return String(value);
+            }
+
+            function renderSessionsTable(rows) {
+                sessionsTableBody.innerHTML = '';
+                if (!Array.isArray(rows) || rows.length === 0) {
+                    const emptyRow = document.createElement('tr');
+                    const emptyCell = document.createElement('td');
+                    emptyCell.colSpan = 10;
+                    emptyCell.className = 'empty-state';
+                    emptyCell.textContent = 'No sessions returned for this instance.';
+                    emptyRow.appendChild(emptyCell);
+                    sessionsTableBody.appendChild(emptyRow);
+                    return;
+                }
+
+                for (const row of rows) {
+                    const tr = document.createElement('tr');
+                    const fields = [
+                        'pid',
+                        'database_name',
+                        'username',
+                        'application_name',
+                        'client_address',
+                        'client_hostname',
+                        'session_start',
+                        'wait_event',
+                        'state',
+                        'query'
+                    ];
+                    for (const field of fields) {
+                        const td = document.createElement('td');
+                        if (field === 'query') {
+                            td.className = 'query-cell';
+                        }
+                        td.textContent = formatCellValue(row[field]);
+                        tr.appendChild(td);
+                    }
+                    sessionsTableBody.appendChild(tr);
+                }
+            }
+
             selector.value = getInstanceParam();
             selector.addEventListener('change', function() { setInstanceParam(this.value); });
-            badge.parentNode.insertBefore(selector, badge.nextSibling);
             // Chart.js setup
             const ctx = document.getElementById('sessionsChart').getContext('2d');
             const chart = new Chart(ctx, {
@@ -6682,12 +6784,18 @@ SESSION_MONITOR_HTML = (
                 const instance = getInstanceParam();
                 const errorDiv = document.getElementById('error-message');
                 try {
-                    const response = await fetch(`/api/sessions?instance=${instance}`);
-                    const data = await response.json();
-                    if (!response.ok) {
+                    const [summaryResponse, sessionsResponse] = await Promise.all([
+                        fetch(`/api/sessions?instance=${instance}`),
+                        fetch(`/api/sessions/list?instance=${instance}`)
+                    ]);
+                    const data = await summaryResponse.json();
+                    const sessionsPayload = await sessionsResponse.json();
+                    if (!summaryResponse.ok || !sessionsResponse.ok) {
                         errorDiv.style.display = 'block';
-                        errorDiv.textContent = data.error || 'Error fetching data';
+                        errorDiv.textContent = data.error || sessionsPayload.error || 'Error fetching data';
                         badge.textContent = 'Instance --';
+                        renderSessionsTable([]);
+                        sessionsTableMeta.textContent = 'Unable to load sessions';
                         return;
                     } else {
                         errorDiv.style.display = 'none';
@@ -6711,10 +6819,14 @@ SESSION_MONITOR_HTML = (
                     chart.data.datasets[2].data.push(data.idle_in_transaction);
                     chart.data.datasets[3].data.push(data.total);
                     chart.update();
+                    sessionsTableMeta.textContent = `${sessionsPayload.count} session${sessionsPayload.count === 1 ? '' : 's'} on instance ${sessionsPayload.instance_id}`;
+                    renderSessionsTable(sessionsPayload.sessions);
                 } catch (error) {
                     errorDiv.style.display = 'block';
                     errorDiv.textContent = 'Error fetching data';
                     badge.textContent = 'Instance --';
+                    renderSessionsTable([]);
+                    sessionsTableMeta.textContent = 'Unable to load sessions';
                 }
             }
             setInterval(fetchData, 5000);
@@ -6738,38 +6850,7 @@ async def sessions_monitor(request: Request) -> HTMLResponse | JSONResponse:
             {"ok": False, "error": "Unsupported database instance id", "instance": instance},
             status_code=400
         )
-    # Inject instance badge and selector into HTML (unchanged)
-    html = SESSION_MONITOR_HTML.replace(
-        "<body>",
-        f"<body>\n<div style='position:fixed;top:10px;right:10px;z-index:1000;'>"
-        f"<form id='instanceForm' style='display:inline;'>"
-        f"<label for='instanceSelect'><b>Instance:</b></label> "
-        f"<select id='instanceSelect' name='instance'>"
-        f"<option value='01' {'selected' if normalized_instance=='01' else ''}>01</option>"
-        f"<option value='02' {'selected' if normalized_instance=='02' else ''}>02</option>"
-        f"</select>"
-        f"</form>"
-        f"<span style='margin-left:10px;padding:2px 8px;border-radius:6px;background:#e0e7ff;color:#3730a3;font-weight:bold;'>Instance {normalized_instance}</span>"
-        f"</div>"
-    )
-    # Add JS to handle instance selection (unchanged)
-    html = html.replace(
-        "</body>",
-        "<script>\n" +
-        "document.getElementById('instanceSelect').addEventListener('change', function() {\n" +
-        "  const val = this.value;\n" +
-        "  const url = new URL(window.location.href);\n" +
-        "  url.searchParams.set('instance', val);\n" +
-        "  window.location.href = url.toString();\n" +
-        "});\n" +
-        "</script>\n</body>"
-    )
-    # Patch JS fetch to include instance param (unchanged)
-    html = html.replace(
-        "fetch('/api/sessions');",
-        "fetch('/api/sessions?instance=" + normalized_instance + "');"
-    )
-    return HTMLResponse(html)
+    return HTMLResponse(SESSION_MONITOR_HTML)
 
 
 @mcp.custom_route("/api/sessions", methods=["GET"])
@@ -6830,6 +6911,54 @@ async def api_sessions(request: Request) -> JSONResponse:
     }
     print("[api_sessions] JSON response:", response)
     return JSONResponse(response)
+
+
+@mcp.custom_route("/api/sessions/list", methods=["GET"])
+async def api_sessions_list(request: Request) -> JSONResponse:
+    instance = request.query_params.get("instance", "01")
+    try:
+        normalized_instance = _normalize_instance_id(instance)
+    except Exception:
+        return JSONResponse(
+            {"ok": False, "error": "Unsupported database instance id", "instance": instance},
+            status_code=400
+        )
+
+    def _query_fn() -> list[dict[str, Any]]:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                _execute_safe(
+                    cur,
+                    """
+                    SELECT
+                        pid,
+                        datname AS database_name,
+                        usename AS username,
+                        application_name AS application_name,
+                        client_addr::text AS client_address,
+                        client_hostname AS client_hostname,
+                        backend_start AS session_start,
+                        wait_event AS wait_event,
+                        state AS state,
+                        query AS query
+                    FROM pg_stat_activity
+                    ORDER BY backend_start DESC NULLS LAST, pid DESC
+                    """
+                )
+                return cur.fetchall()
+
+    sessions = _make_json_serializable(_run_in_instance_sync(normalized_instance, _query_fn))
+    meta = _resolve_instance_metadata(normalized_instance)
+    return JSONResponse(
+        {
+            "instance_id": meta.get("id"),
+            "host": meta.get("host"),
+            "database": meta.get("name"),
+            "count": len(sessions),
+            "sessions": sessions,
+            "timestamp": time.time(),
+        }
+    )
 
 async def health_check(_request: Request) -> JSONResponse:
     return JSONResponse({"status": "healthy"})
