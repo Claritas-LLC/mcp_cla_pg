@@ -75,8 +75,12 @@ docker push harryvaldez/mcp-postgres:latest
 
 Current published tags:
 - `harryvaldez/mcp-postgres:latest`
+- `harryvaldez/mcp-postgres:9a7a277`
 - `harryvaldez/mcp-postgres:v1.0.1`
 - `harryvaldez/mcp-postgres:bf1b5a2`
+
+Pinned immutable image reference (recommended for production):
+- `harryvaldez/mcp-postgres@sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d`
 
 Notes:
 - The base image is python:3.13-slim.
@@ -107,10 +111,12 @@ We provide a Bicep template (`deploy/azure-aca.bicep`) for easy deployment to Az
       --resource-group <YourResourceGroup> \
       --template-file deploy/azure-aca.bicep \
       --parameters \
-        containerImage="harryvaldez/mcp-postgres:latest" \
+        containerImage="harryvaldez/mcp-postgres@sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d" \
         databaseUrl="postgresql://user:pass@host:5432/dbname" \
         allowWrite=false
     ```
+
+      For AWS ECS, use the same immutable image reference in your `ContainerImage` parameter value.
 
 ---
 

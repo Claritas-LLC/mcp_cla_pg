@@ -61,8 +61,16 @@ For hardening-audit artifacts (credential scoping, rate limiting/circuit breaker
 ## 📌 Current Release
 
 - Git tag: `v1.1.0`
-- Docker tags: `harryvaldez/mcp-postgres:latest`, `harryvaldez/mcp-postgres:v1.1.0`, `harryvaldez/mcp-postgres:1.0.0`
-- Image digest: `sha256:602e3d7d7603ca6da1987e41fb1a21ef2d4bbaf90f601dee0828d7d535701dd5`
+- Docker tags: `harryvaldez/mcp-postgres:latest`, `harryvaldez/mcp-postgres:9a7a277`, `harryvaldez/mcp-postgres:v1.1.0`, `harryvaldez/mcp-postgres:1.0.0`
+- Image digest: `sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d`
+
+Pinned image reference (recommended for production): `harryvaldez/mcp-postgres@sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d`
+
+### Latest Publish Snapshot (2026-04-07)
+
+- Git commit: `9a7a277` (pushed to `main`)
+- Docker tags pushed: `harryvaldez/mcp-postgres:latest`, `harryvaldez/mcp-postgres:9a7a277`
+- Docker image digest: `sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d`
 
 ### Latest Publish Snapshot (2026-03-17)
 
@@ -74,6 +82,7 @@ For hardening-audit artifacts (credential scoping, rate limiting/circuit breaker
 
 | Date | Git commit | Docker tags | Image digest |
 |------|------------|-------------|--------------|
+| 2026-04-07 | `9a7a277` | `latest`, `9a7a277` | `sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d` |
 | 2026-03-17 | `547e383` | `latest`, `1.0.0` | `sha256:602e3d7d7603ca6da1987e41fb1a21ef2d4bbaf90f601dee0828d7d535701dd5` |
 | 2026-03-05 | `4aafa3e` | `latest`, `4aafa3e` | `sha256:81c7d249e4202277adcb6a20e4fbb21952e31b3d7b633e6ca8869f986a62b073` |
 | 2026-03-05 | `c6286d4` | `latest`, `c6286d4` | `sha256:81c7d249e4202277adcb6a20e4fbb21952e31b3d7b633e6ca8869f986a62b073` |
@@ -355,6 +364,9 @@ The Docker image is available on Docker Hub at `harryvaldez/mcp-postgres`.
 # 1. Pull the image
 docker pull harryvaldez/mcp-postgres:latest
 
+# Optional: pull immutable digest-pinned image
+docker pull harryvaldez/mcp-postgres@sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d
+
 # 2. Run in HTTP Mode (SSE)
 docker run -d \
   --name mcp-postgres-http \
@@ -362,7 +374,7 @@ docker run -d \
   -e MCP_TRANSPORT=http \
   -e MCP_ALLOW_WRITE=false
   -p 8000:8000 \
-  harryvaldez/mcp-postgres:latest
+  harryvaldez/mcp-postgres@sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d
 
 # 3. Run in Write Mode (HTTP - Secure)
 docker run -d \
@@ -376,7 +388,7 @@ docker run -d \
   -e FASTMCP_AZURE_AD_TENANT_ID=... \
   -e FASTMCP_AZURE_AD_CLIENT_ID=... \
   -p 8001:8000 \
-  harryvaldez/mcp-postgres:latest
+  harryvaldez/mcp-postgres@sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d
 ```
 
 ### Option 2b: Docker with SSH Tunneling
@@ -394,7 +406,7 @@ docker run -d \
   -e ALLOW_SSH_AGENT=true \
   -e MCP_TRANSPORT=http \
   -p 8000:8000 \
-  harryvaldez/mcp-postgres:latest
+  harryvaldez/mcp-postgres@sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d
 ```
 
 **Using Docker Compose:**
