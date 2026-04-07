@@ -58,19 +58,20 @@ If the `instance` parameter is omitted, instance `01` is used by default. The UI
 
 For hardening-audit artifacts (credential scoping, rate limiting/circuit breaker, and prompt audit logging), see [AUDIT_EVIDENCE_PACK.md](AUDIT_EVIDENCE_PACK.md).
 
+
 ## 📌 Current Release
 
 - Git tag: `v1.1.0`
-- Docker tags: `harryvaldez/mcp-postgres:latest`, `harryvaldez/mcp-postgres:9a7a277`, `harryvaldez/mcp-postgres:v1.1.0`, `harryvaldez/mcp-postgres:1.0.0`
-- Image digest: `sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d`
+- Docker tags: `harryvaldez/mcp-postgres:latest`, `harryvaldez/mcp-postgres:93f6fbc`, `harryvaldez/mcp-postgres:v1.1.0`, `harryvaldez/mcp-postgres:1.0.0`
+- Image digest: `sha256:86ca24f17a6a77eb0823d7e63a3d3c7d72ac38d4efb08caea93b536c2f3a3583`
 
-Pinned image reference (recommended for production): `harryvaldez/mcp-postgres@sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d`
+Pinned image reference (recommended for production): `harryvaldez/mcp-postgres@sha256:86ca24f17a6a77eb0823d7e63a3d3c7d72ac38d4efb08caea93b536c2f3a3583`
 
 ### Latest Publish Snapshot (2026-04-07)
 
-- Git commit: `9a7a277` (pushed to `main`)
-- Docker tags pushed: `harryvaldez/mcp-postgres:latest`, `harryvaldez/mcp-postgres:9a7a277`
-- Docker image digest: `sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d`
+- Git commit: `93f6fbc` (pushed to `main`)
+- Docker tags pushed: `harryvaldez/mcp-postgres:latest`, `harryvaldez/mcp-postgres:93f6fbc`
+- Docker image digest: `sha256:86ca24f17a6a77eb0823d7e63a3d3c7d72ac38d4efb08caea93b536c2f3a3583`
 
 ### Latest Publish Snapshot (2026-03-17)
 
@@ -82,7 +83,7 @@ Pinned image reference (recommended for production): `harryvaldez/mcp-postgres@s
 
 | Date | Git commit | Docker tags | Image digest |
 |------|------------|-------------|--------------|
-| 2026-04-07 | `9a7a277` | `latest`, `9a7a277` | `sha256:13d89ff087aa0f2f7eacbdadec279d0a8810812b2fefd4b8f057ba763be4676d` |
+| 2026-04-07 | `93f6fbc` | `latest`, `93f6fbc` | `sha256:86ca24f17a6a77eb0823d7e63a3d3c7d72ac38d4efb08caea93b536c2f3a3583` |
 | 2026-03-17 | `547e383` | `latest`, `1.0.0` | `sha256:602e3d7d7603ca6da1987e41fb1a21ef2d4bbaf90f601dee0828d7d535701dd5` |
 | 2026-03-05 | `4aafa3e` | `latest`, `4aafa3e` | `sha256:81c7d249e4202277adcb6a20e4fbb21952e31b3d7b633e6ca8869f986a62b073` |
 | 2026-03-05 | `c6286d4` | `latest`, `c6286d4` | `sha256:81c7d249e4202277adcb6a20e4fbb21952e31b3d7b633e6ca8869f986a62b073` |
