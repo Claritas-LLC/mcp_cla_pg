@@ -4154,7 +4154,7 @@ def db_pg96_db_sec_perf_metrics(
                   current_setting('superuser_reserved_connections')::int as reserved_connections,
                   count(*) as active_connections,
                   current_setting('max_connections')::int - count(*) as available_connections
-                from pg_stat_activity
+                from public.get_stat_activity()
                 where state != 'idle'
                 """
             )
@@ -4572,7 +4572,7 @@ def db_pg96_analyze_sessions(
                   count(*) filter (where state = 'active') as active_count,
                   count(*) filter (where state like 'idle%') as idle_count,
                   count(*) filter (where wait_event is not null) as waiting_count
-                from pg_stat_activity
+                from public.get_stat_activity()
                 where pid <> pg_backend_pid()
                 """
             )
@@ -4595,7 +4595,7 @@ def db_pg96_analyze_sessions(
                       wait_event_type,
                       wait_event,
                       left(query, 5000) as query
-                    from pg_stat_activity
+                    from public.get_stat_activity()
                     where pid <> pg_backend_pid()
                       and (
                         (query_start is not null and now() - query_start > make_interval(secs => %(min_duration)s))
@@ -4621,7 +4621,7 @@ def db_pg96_analyze_sessions(
                       now() - backend_start as connection_duration,
                       now() - state_change as idle_duration,
                       left(query, 1000) as last_query
-                    from pg_stat_activity
+                    from public.get_stat_activity()
                     where state in ('idle', 'idle in transaction', 'idle in transaction (aborted)')
                       and pid <> pg_backend_pid()
                       and now() - state_change > make_interval(secs => %(min_idle)s)
@@ -4656,7 +4656,7 @@ def db_pg96_analyze_sessions(
                          and pg_locks.classid = bl.classid and pg_locks.objid = bl.objid 
                          and pg_locks.objsubid = bl.objsubid limit 1) as blocking_pid
                       from pg_catalog.pg_locks bl
-                      join pg_catalog.pg_stat_activity a on a.pid = bl.pid
+                      join pg_catalog.public.get_stat_activity() a on a.pid = bl.pid
                       where not bl.granted
                         and bl.pid <> pg_backend_pid()
                     )
@@ -4671,8 +4671,8 @@ def db_pg96_analyze_sessions(
                       blocked_query,
                       blocked_lock_mode,
                       blocking_pid,
-                      (select usename from pg_stat_activity where pid = blocking_pid) as blocking_user,
-                      (select left(query, 200) from pg_stat_activity where pid = blocking_pid) as blocking_query
+                      (select usename from public.get_stat_activity() where pid = blocking_pid) as blocking_user,
+                      (select left(query, 200) from public.get_stat_activity() where pid = blocking_pid) as blocking_query
                     from lock_chains
                     where blocking_pid is not null
                     order by blocked_execution_time desc
@@ -6905,7 +6905,7 @@ async def api_sessions(request: Request) -> JSONResponse:
                         sum(case when state = 'idle' then 1 else 0 end) as idle,
                         sum(case when state in ('idle in transaction', 'idle in transaction (aborted)') then 1 else 0 end) as idle_in_transaction,
                         count(*) as total
-                    FROM pg_stat_activity
+                    FROM public.get_stat_activity()
                     """
                 )
                 row = cur.fetchone()
@@ -6961,7 +6961,7 @@ async def api_sessions_list(request: Request) -> JSONResponse:
                         wait_event AS wait_event,
                         state AS state,
                         query AS query
-                    FROM pg_stat_activity
+                    FROM public.get_stat_activity()
                     ORDER BY backend_start DESC NULLS LAST, pid DESC
                     """
                 )
@@ -7768,7 +7768,7 @@ async def db_pg96_analyze_sessions_async(
                   count(*) filter (where state = 'active') as active_count,
                   count(*) filter (where state like 'idle%') as idle_count,
                   count(*) filter (where wait_event is not null) as waiting_count
-                from pg_stat_activity
+                from public.get_stat_activity()
                 where pid <> pg_backend_pid()
                 """
             )
@@ -7792,7 +7792,7 @@ async def db_pg96_analyze_sessions_async(
                       wait_event_type,
                       wait_event,
                       left(query, 5000) as query
-                    from pg_stat_activity
+                    from public.get_stat_activity()
                     where pid <> pg_backend_pid()
                       and (
                         (query_start is not null and now() - query_start > make_interval(secs => %(min_duration)s))
@@ -7820,7 +7820,7 @@ async def db_pg96_analyze_sessions_async(
                       now() - backend_start as connection_duration,
                       now() - state_change as idle_duration,
                       left(query, 1000) as last_query
-                    from pg_stat_activity
+                    from public.get_stat_activity()
                     where state in ('idle', 'idle in transaction', 'idle in transaction (aborted)')
                       and pid <> pg_backend_pid()
                       and now() - state_change > make_interval(secs => %(min_idle)s)
@@ -7846,7 +7846,7 @@ async def db_pg96_analyze_sessions_async(
                       bl.mode as blocked_lock_mode,
                       a.query as blocked_query
                     from pg_catalog.pg_locks bl
-                    join pg_catalog.pg_stat_activity a on bl.pid = a.pid
+                    join pg_catalog.public.get_stat_activity() a on bl.pid = a.pid
                     where not bl.granted
                     limit 50
                     """
